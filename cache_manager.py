@@ -5,43 +5,40 @@ Provides:
   - Block: a single KV cache block descriptor.
   - HybridCache: manages block allocation, prefix matching via radix index,
     reference counting, garbage collection, and GPU-memory-aware sizing.
-
-Design doc: see project README for the full architecture specification.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+from array import array
 
 logger = logging.getLogger(__name__)
 
 
 class Block:
-    """A single KV-cache block descriptor."""
+    """A single KV-cache block descriptor.
 
-    __slots__ = ("block_id", "next_block_id", "physical_address", "ref_count", "token_ids_hash")
+    Uses ``__slots__`` with ``hash_chain`` stored as ``array('i')``
+    for compact memory layout and fast integer iteration.
+    """
+
+    __slots__ = ("block_id", "hash_chain", "kv_tensor", "ref_count")
 
     def __init__(
         self,
         block_id: int,
-        physical_address: int,
-        token_ids_hash: str,
+        token_ids: list[int],
+        kv_tensor: object = None,
         ref_count: int = 1,
-        next_block_id: int | None = None,
     ) -> None:
         self.block_id = block_id
-        self.physical_address = physical_address
-        self.token_ids_hash = token_ids_hash
+        self.hash_chain: array = array("i", token_ids)
+        self.kv_tensor = kv_tensor
         self.ref_count = ref_count
-        self.next_block_id = next_block_id
 
     def __repr__(self) -> str:
-        return (
-            f"Block(id={self.block_id}, phys={self.physical_address}, "
-            f"hash={self.token_ids_hash[:12]}..., refs={self.ref_count}, "
-            f"next={self.next_block_id})"
-        )
+        return f"Block(id={self.block_id}, chain_len={len(self.hash_chain)}, refs={self.ref_count})"
 
 
 class HybridCache:
@@ -49,56 +46,61 @@ class HybridCache:
     A hybrid radix-tree / block-based KV cache.
 
     Features:
-      - Incremental SHA-256 token hashing (NOT hashlib.update; uses digest chains).
-      - GPU-memory-aware total_blocks calculation via torch.cuda.mem_get_info().
+      - Incremental SHA-256 token hashing.
+      - GPU-memory-aware total_blocks calculation.
       - Free-block queue for O(1) allocation.
-      - Radix index for longest-prefix matching.
-      - Reference-count-based garbage collection.
+      - Radix index for longest-prefix matching with LRU cache.
+      - Reference-count-based GC.
+      - Hash-tree prefetch on leaf cache hit.
+
+    [Bug 2] Radix index uses ``dict[str, set[int]]`` so multiple blocks
+    sharing the same prefix hash are all tracked — no 1-to-1 overwrite.
     """
+
+    _PREFETCH_FANOUT_MAX: int = 3
+    _MEM_FRACTION: float = 0.50
 
     def __init__(
         self,
         block_size: int = 16,
         hidden_size: int = 4096,
         total_blocks: int | None = None,
+        mem_fraction: float | None = None,
     ) -> None:
-        """
-        Args:
-            block_size: Number of tokens per block.
-            hidden_size: Hidden dimension size (used for memory accounting).
-            total_blocks: If given, overrides the automatic GPU-memory-based count.
-        """
         self.block_size = block_size
         self.hidden_size = hidden_size
+
+        if mem_fraction is not None:
+            self._MEM_FRACTION = mem_fraction
 
         if total_blocks is not None:
             self.total_blocks = total_blocks
         else:
-            self.total_blocks = self._compute_total_blocks(block_size, hidden_size)
+            self.total_blocks = self._compute_total_blocks(
+                block_size, hidden_size, self._MEM_FRACTION
+            )
 
-        # Byte-equivalent size of one "slot" in GPU memory (float16 × 2 matrices × k/v).
         self._slot_bytes = self.block_size * self.hidden_size * 2 * 2
 
-        # Free-block queue (LIFO for locality).
         self.free_block_queue: list[int] = list(range(self.total_blocks))
-
-        # Live block descriptors.
         self.allocated_blocks: dict[int, Block] = {}
+        # [Bug 2] set[int] instead of int: multiple blocks can share a prefix.
+        self.radix_index: dict[str, set[int]] = {}
 
-        # Radix index: cumulative-token-hash → block_id.
-        self.radix_index: dict[str, int] = {}
+        self._hash_tree: dict[str, list[str]] = {}
 
-        # LRU cache for match_prefix results.
-        # Cache key: hash of first 8 tokens. Value: (block_id | None, split_index).
-        self._match_cache: dict[int, tuple[int | None, int]] = {}
-        self._match_cache_lru: list[int] = []
+        # [Bug 9] LRU cache keyed on tuple of first 8 tokens, not hash().
+        self._match_cache: dict[tuple, tuple[int | None, int]] = {}
+        self._match_cache_lru: list[tuple] = []
         self._match_cache_max = 256
 
+        self._prefetch_stream: object | None = None
+
         logger.info(
-            "HybridCache initialized: block_size=%d, total_blocks=%d, slot_bytes=%d",
+            "HybridCache initialized: block_size=%d, total_blocks=%d, mem_frac=%.2f",
             self.block_size,
             self.total_blocks,
-            self._slot_bytes,
+            self._MEM_FRACTION,
         )
 
     # ------------------------------------------------------------------
@@ -106,41 +108,22 @@ class HybridCache:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _compute_total_blocks(block_size: int = 16, hidden_size: int = 4096) -> int:
-        """
-        Determine total_blocks dynamically from available GPU memory.
-
-        Formula:
-            total_blocks = int((free_mem * 0.85) / (block_size * hidden_size * 2 * 2))
-
-        Falls back to 10 000 when torch/cuda is unavailable.
-
-        Args:
-            block_size: Number of tokens per block (used in memory formula).
-            hidden_size: Hidden dimension of the model (used in memory formula).
-        """
+    def _compute_total_blocks(
+        block_size: int = 16, hidden_size: int = 4096, mem_fraction: float = 0.50
+    ) -> int:
         try:
             import torch  # noqa: PLC0415
 
-            free_mem, _ = torch.cuda.mem_get_info()  # bytes
+            free_mem, _ = torch.cuda.mem_get_info()
             slot_bytes = block_size * hidden_size * 2 * 2
-            total = int((free_mem * 0.85) / slot_bytes)
-            logger.info("GPU free mem: %d bytes → total_blocks=%d", free_mem, total)
+            total = int((free_mem * mem_fraction) / slot_bytes)
+            logger.info("GPU free mem: %d bytes -> total_blocks=%d", free_mem, total)
             return max(total, 1)
         except (ImportError, RuntimeError, AttributeError):
             logger.warning("torch.cuda unavailable; using default total_blocks=10000")
             return 10_000
 
-    # ------------------------------------------------------------------
-    # GPU memory slot (simplified)
-    # ------------------------------------------------------------------
-
     def get_gpu_memory_slot(self, block_id: int) -> int:
-        """
-        Simplified offset calculation for the physical memory slot.
-
-        Returns the byte offset into pre-allocated cache memory.
-        """
         return block_id * self._slot_bytes
 
     # ------------------------------------------------------------------
@@ -149,19 +132,6 @@ class HybridCache:
 
     @staticmethod
     def _incremental_hash(previous_hex: str, token: int) -> str:
-        """
-        Compute the next cumulative hash.
-
-        IMPORTANT: Uses SHA-256 chaining — NOT ``hashlib.update()``.
-            hash_n = SHA256(SHA256(previous_hex_bytes).digest() + token_bytes).hexdigest()
-
-        Args:
-            previous_hex: The cumulative hex hash from the previous step.
-            token: The next integer token ID.
-
-        Returns:
-            New cumulative hex hash.
-        """
         prev_bytes = bytes.fromhex(previous_hex)
         prev_digest = hashlib.sha256(prev_bytes).digest()
         token_bytes = token.to_bytes(4, "little", signed=True)
@@ -169,7 +139,6 @@ class HybridCache:
 
     @staticmethod
     def _hash_single_token(token: int) -> str:
-        """Initial hash for the very first token in a sequence."""
         token_bytes = token.to_bytes(4, "little", signed=True)
         return hashlib.sha256(token_bytes).hexdigest()
 
@@ -181,98 +150,80 @@ class HybridCache:
         """
         Allocate a new block for the given prompt tokens.
 
-        Pops a block_id from the free queue, builds the cumulative hash,
-        registers ALL intermediate cumulative hashes in ``radix_index``
-        (so that ``match_prefix`` can match any prefix), and stores the
-        final hash in the Block descriptor.
-
-        Raises
-        ------
-        RuntimeError
-            If no free blocks remain.
+        [Bug 2] Uses set[int] in radix_index so shared prefixes don't collide.
         """
-        if not self.free_block_queue:
+        free = self.free_block_queue
+        blocks = self.allocated_blocks
+        radix = self.radix_index
+        tree = self._hash_tree
+
+        if not free:
             raise RuntimeError("No free blocks available in HybridCache")
 
-        block_id = self.free_block_queue.pop()
-        token_hash = self._incremental_hash_from_tokens(prompt_tokens)
+        block_id = free.pop()
 
-        physical_address = self.get_gpu_memory_slot(block_id)
         new_block = Block(
             block_id=block_id,
-            physical_address=physical_address,
-            token_ids_hash=token_hash,
+            token_ids=prompt_tokens,
+            kv_tensor=None,
             ref_count=1,
-            next_block_id=None,
         )
-        self.allocated_blocks[block_id] = new_block
+        blocks[block_id] = new_block
 
-        # Register ALL intermediate cumulative hashes so match_prefix
-        # can match any prefix of the block's token sequence.
-        self._register_all_hashes(prompt_tokens, block_id)
+        cumulative = self._hash_single_token(prompt_tokens[0])
+        prev_hash: str = cumulative
+        radix.setdefault(cumulative, set()).add(block_id)
+        tree.setdefault(cumulative, [])
+
+        for token in prompt_tokens[1:]:
+            cumulative = self._incremental_hash(cumulative, token)
+            radix.setdefault(cumulative, set()).add(block_id)
+            tree.setdefault(prev_hash, []).append(cumulative)
+            prev_hash = cumulative
 
         logger.debug(
-            "Allocated block %d (final_hash=%s...)",
+            "Allocated block %d (tokens=%s...)",
             block_id,
-            token_hash[:12],
+            str(prompt_tokens[:4])[:-1],
         )
         return new_block
-
-    def _incremental_hash_from_tokens(self, tokens: list[int]) -> str:
-        """Build the cumulative hex hash for a list of tokens."""
-        if not tokens:
-            raise ValueError("Cannot hash an empty token list")
-        h = self._hash_single_token(tokens[0])
-        for token in tokens[1:]:
-            h = self._incremental_hash(h, token)
-        return h
-
-    def _register_all_hashes(self, tokens: list[int], block_id: int) -> None:
-        """Register every intermediate cumulative hash in radix_index."""
-        cumulative = self._hash_single_token(tokens[0])
-        self.radix_index[cumulative] = block_id
-        for token in tokens[1:]:
-            cumulative = self._incremental_hash(cumulative, token)
-            self.radix_index[cumulative] = block_id
 
     # ------------------------------------------------------------------
     # Prefix matching
     # ------------------------------------------------------------------
 
-    def match_prefix(
-        self, prompt_tokens: list[int]
-    ) -> tuple[int | None, list[int]]:
+    def match_prefix(self, prompt_tokens: list[int]) -> tuple[int | None, list[int]]:
         """
         Find the longest prefix of ``prompt_tokens`` that exists in the cache.
 
-        Uses an LRU cache (keyed by hash of first 8 tokens) for O(1) hit
-        performance on repeated lookups, plus fast token-by-token traversal
-        with result caching on cache misses.
-
-        Returns
-        -------
-        (matched_block_id, remaining_tokens)
-            If a prefix was found, ``matched_block_id`` is the last (deepest)
-            block id whose cumulative hash is in the radix index, and
-            ``remaining_tokens`` are the unmatched suffix.
-            If nothing matched, ``(None, prompt_tokens)`` is returned.
+        [Bug 2] Tracks candidate block sets through each step via intersection,
+        so only consistent prefix paths are returned.  When no set is consistent
+        with the prompt, returns the last consistent prefix.
         """
-        # Step 1: LRU cache lookup (keyed by first 8 tokens hash)
-        cache_key = hash(tuple(prompt_tokens[:8]))
-        if cache_key in self._match_cache:
-            block_id, matched_len = self._match_cache[cache_key]
-            # LRU hit promotion
-            self._match_cache_lru.remove(cache_key)
-            self._match_cache_lru.append(cache_key)
+        blocks = self.allocated_blocks
+        radix = self.radix_index
+        match_cache = self._match_cache
+        match_lru = self._match_cache_lru
+
+        # [Bug 9] Use tuple of first 8 tokens directly as cache key.
+        cache_key = tuple(prompt_tokens[:8])
+        if cache_key in match_cache:
+            block_id, matched_len = match_cache[cache_key]
+            match_lru.remove(cache_key)
+            match_lru.append(cache_key)
             if block_id is not None:
-                self.allocated_blocks[block_id].ref_count += 1
+                block = blocks.get(block_id)
+                if block is not None:
+                    block.ref_count += 1
+                if matched_len == len(prompt_tokens) and block is not None:
+                    self._try_prefetch_children(block)
                 return block_id, prompt_tokens[matched_len:]
             return None, prompt_tokens
 
-        # Step 2: Token-by-token traversal matching cumulative hashes
         cumulative_hash: str = ""
         last_matched_block_id: int | None = None
-        split_index = 0
+        split_index: int = 0
+        prev_candidates: set[int] | None = None
 
         for i, token in enumerate(prompt_tokens):
             if i == 0:
@@ -280,26 +231,86 @@ class HybridCache:
             else:
                 cumulative_hash = self._incremental_hash(cumulative_hash, token)
 
-            if cumulative_hash in self.radix_index:
-                last_matched_block_id = self.radix_index[cumulative_hash]
-                split_index = i + 1
-            else:
+            step_candidates = radix.get(cumulative_hash, set())
+            if not step_candidates:
                 break
 
-        # Step 3: Update LRU cache
+            if prev_candidates is not None:
+                consistent = step_candidates & prev_candidates
+            else:
+                consistent = step_candidates
+
+            if not consistent:
+                break
+
+            last_matched_block_id = next(iter(consistent))
+            split_index = i + 1
+            prev_candidates = consistent
+
         result = (last_matched_block_id, split_index)
-        self._match_cache[cache_key] = result
-        self._match_cache_lru.append(cache_key)
-        if len(self._match_cache_lru) > self._match_cache_max:
-            old_key = self._match_cache_lru.pop(0)
-            self._match_cache.pop(old_key, None)
+        match_cache[cache_key] = result
+        match_lru.append(cache_key)
+        if len(match_lru) > self._match_cache_max:
+            old_key = match_lru.pop(0)
+            match_cache.pop(old_key, None)
 
         if last_matched_block_id is not None:
-            # Bump ref count for the matched block.
-            self.allocated_blocks[last_matched_block_id].ref_count += 1
+            block = blocks.get(last_matched_block_id)
+            if block is not None:
+                block.ref_count += 1
+            if split_index == len(prompt_tokens) and block is not None:
+                self._try_prefetch_children(block)
             return last_matched_block_id, prompt_tokens[split_index:]
         else:
             return None, prompt_tokens
+
+    # ------------------------------------------------------------------
+    # [Step 7] Hash-tree prefetch
+    # ------------------------------------------------------------------
+
+    def _try_prefetch_children(self, block: Block) -> None:
+        try:
+            import torch  # noqa: PLC0415
+
+            chain = block.hash_chain
+            if len(chain) == 0:
+                return
+            leaf_hash = self._hash_single_token(chain[0])
+            for tok in chain[1:]:
+                leaf_hash = self._incremental_hash(leaf_hash, tok)
+
+            children = self._hash_tree.get(leaf_hash, [])
+            if not children:
+                return
+
+            children = children[: self._PREFETCH_FANOUT_MAX]
+            radix = self.radix_index
+            allocated = self.allocated_blocks
+
+            total_prefetch = len(children) * self._slot_bytes
+            free_mem, _ = torch.cuda.mem_get_info()
+            if free_mem < total_prefetch * 2:
+                return
+
+            if self._prefetch_stream is None:
+                self._prefetch_stream = torch.cuda.Stream(priority=-1)
+
+            with torch.cuda.stream(self._prefetch_stream):
+                for child_hash in children:
+                    cids = radix.get(child_hash, set())
+                    for cid in cids:
+                        child_block = allocated.get(cid)
+                        if child_block is None:
+                            continue
+                        kv = child_block.kv_tensor
+                        if kv is None:
+                            continue
+                        if kv.device.type != "cuda":
+                            _ = kv.to(device="cuda", non_blocking=True)
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Free / reference-count management
@@ -309,12 +320,14 @@ class HybridCache:
         """
         Decrease the reference count of a block.
 
-        If ref_count reaches zero, the block is evicted: ``block_id`` is
-        recycled to ``free_block_queue`` and the block is removed from
-        ``allocated_blocks``.  Radix-index entries pointing to this block
-        are cleaned up with a compound key guard.
+        [Bug 2] Removes block_id from radix_index sets rather than deleting
+        straight dict entries.
         """
-        block = self.allocated_blocks.get(block_id)
+        free = self.free_block_queue
+        blocks = self.allocated_blocks
+        radix = self.radix_index
+
+        block = blocks.get(block_id)
         if block is None:
             logger.warning("free_block: block %d not found", block_id)
             return
@@ -323,20 +336,13 @@ class HybridCache:
         logger.debug("free_block %d: ref_count now %d", block_id, block.ref_count)
 
         if block.ref_count <= 0:
-            # Recycle the block id.
-            self.free_block_queue.append(block_id)
-            self.allocated_blocks.pop(block_id, None)
-            # Clean up radix_index entries pointing to this block
-            # (compound key guard: only delete if still points to us).
-            stale = [
-                h for h, bid in self.radix_index.items()
-                if bid == block_id
-            ]
+            free.append(block_id)
+            blocks.pop(block_id, None)
+            stale = [h for h, bids in radix.items() if block_id in bids]
             for h in stale:
-                # Compound key guard: verify the entry still points to our
-                # block_id before deleting (protects against reuse race).
-                if self.radix_index.get(h) == block_id:
-                    del self.radix_index[h]
+                radix[h].discard(block_id)
+                if not radix[h]:
+                    del radix[h]
             logger.debug(
                 "Block %d recycled to free queue, removed %d radix entries",
                 block_id,
@@ -348,34 +354,23 @@ class HybridCache:
     # ------------------------------------------------------------------
 
     def gc(self) -> int:
-        """
-        Garbage-collect stale entries from ``radix_index``.
-
-        Removes entries whose target block is no longer alive (evicted
-        from ``allocated_blocks``).  Uses a compound key guard so that a
-        hash re-used by a newly allocated block is not prematurely
-        deleted.
-
-        Returns
-        -------
-        int
-            Number of entries removed from ``radix_index``.
-        """
+        """[Bug 2] Iterates set values and prunes stale block_ids per hash."""
         removed = 0
         stale_keys: list[str] = []
+        blocks = self.allocated_blocks
+        radix = self.radix_index
 
-        for h, bid in self.radix_index.items():
-            block = self.allocated_blocks.get(bid)
-            if block is None:
-                stale_keys.append(h)
+        for h, bids in radix.items():
+            stale = [bid for bid in bids if bid not in blocks]
+            if stale:
+                for bid in stale:
+                    bids.discard(bid)
+                    removed += 1
+                if not bids:
+                    stale_keys.append(h)
 
         for key in stale_keys:
-            # Compound key guard: only delete if the entry still points
-            # to the same (now-dead) block_id as when we inspected it.
-            bid = self.radix_index.get(key)
-            if bid is not None and bid not in self.allocated_blocks:
-                del self.radix_index[key]
-                removed += 1
+            del radix[key]
 
         if removed:
             logger.info("GC removed %d stale radix entries", removed)
@@ -387,16 +382,13 @@ class HybridCache:
 
     @property
     def used_blocks(self) -> int:
-        """Number of currently allocated blocks."""
         return len(self.allocated_blocks)
 
     @property
     def free_blocks(self) -> int:
-        """Number of blocks in the free queue."""
         return len(self.free_block_queue)
 
     def stats(self) -> dict[str, int]:
-        """Return a snapshot of usage statistics."""
         return {
             "total_blocks": self.total_blocks,
             "used_blocks": self.used_blocks,

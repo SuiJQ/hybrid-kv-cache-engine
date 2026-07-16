@@ -44,6 +44,19 @@ import torch
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# [Step 1] Global mmap reference registry — prevents GC of active mmaps
+# so that torch.frombuffer views into them remain valid.
+# ---------------------------------------------------------------------------
+_MMAP_REGISTRY: list[mmap.mmap] = []
+"""Hold a strong reference to every open mmap that has live tensor views."""
+
+
+def _register_mmap(m: mmap.mmap) -> None:
+    """Add *m* to the global registry so it is never GC'd."""
+    _MMAP_REGISTRY.append(m)
+
+
+# ---------------------------------------------------------------------------
 # GGML type constants
 # ---------------------------------------------------------------------------
 
@@ -85,14 +98,14 @@ GGUF_META_TYPE_FLOAT64 = 12
 GGML_BLOCK_SIZES = {
     GGML_TYPE_F32: 1,
     GGML_TYPE_F16: 1,
-    GGML_TYPE_Q4_0: 32,   # 32 elements per block, 18 bytes each
-    GGML_TYPE_Q8_0: 32,   # 32 elements per block, 34 bytes each
+    GGML_TYPE_Q4_0: 32,  # 32 elements per block, 18 bytes each
+    GGML_TYPE_Q8_0: 32,  # 32 elements per block, 34 bytes each
 }
 
 # Per-block byte size: (scale_dtype_size + quantized_data_size)
 GGML_BLOCK_BYTES = {
-    GGML_TYPE_Q4_0: 18,   # 2 (fp16 scale) + 16 (packed 4-bit)
-    GGML_TYPE_Q8_0: 34,   # 2 (fp16 scale) + 32 (int8 values)
+    GGML_TYPE_Q4_0: 18,  # 2 (fp16 scale) + 16 (packed 4-bit)
+    GGML_TYPE_Q8_0: 34,  # 2 (fp16 scale) + 32 (int8 values)
 }
 
 # Human-readable names for logging
@@ -123,11 +136,12 @@ GGML_TYPE_NAMES = {
 @dataclass
 class TensorInfo:
     """Metadata for one tensor in the GGUF file."""
+
     name: str
     dims: list[int]
     ggml_type: int
-    offset: int          # byte offset from start of tensor data section
-    n_bytes: int = 0     # computed on init
+    offset: int  # byte offset from start of tensor data section
+    n_bytes: int = 0  # computed on init
 
 
 @dataclass
@@ -212,13 +226,12 @@ def _read_string(buf: memoryview, offset: int) -> tuple[str, int]:
     """
     length = _read_uint64_le(buf, offset)
     start = offset + 8
-    raw = bytes(buf[start:start + length])
+    raw = bytes(buf[start : start + length])
     string = raw.decode("utf-8", errors="replace")
     return string, 8 + length
 
 
-def _read_metadata_value(buf: memoryview, offset: int, value_type: int
-                         ) -> tuple[Any, int]:
+def _read_metadata_value(buf: memoryview, offset: int, value_type: int) -> tuple[Any, int]:
     """Read a single metadata value.
 
     Returns (parsed_value, bytes_consumed).
@@ -258,8 +271,7 @@ def _read_metadata_value(buf: memoryview, offset: int, value_type: int
     elif value_type == GGUF_META_TYPE_FLOAT64:
         return _read_float64_le(buf, offset), 8
     else:
-        logger.warning("Unknown GGUF metadata value type %d, skipping 4 bytes",
-                       value_type)
+        logger.warning("Unknown GGUF metadata value type %d, skipping 4 bytes", value_type)
         return None, 4
 
 
@@ -286,7 +298,8 @@ def _compute_tensor_n_bytes(ggml_type: int, dims: list[int]) -> int:
         logger.warning(
             "GGML type %d (%s) byte-size estimation not available — "
             "using raw n_bytes=0 (will fail at load time)",
-            ggml_type, GGML_TYPE_NAMES.get(ggml_type, "?"),
+            ggml_type,
+            GGML_TYPE_NAMES.get(ggml_type, "?"),
         )
         return 0
 
@@ -315,6 +328,9 @@ def open_gguf(path: str | Path) -> GGUFFile:
     finally:
         os.close(fd)
 
+    # [Step 1] Register mmap globally so torch.frombuffer views stay valid.
+    _register_mmap(buf)
+
     try:
         # --- Parse file header ---
         magic = bytes(buf[:4])
@@ -327,19 +343,17 @@ def open_gguf(path: str | Path) -> GGUFFile:
 
         logger.info(
             "GGUF header: version=%d, tensors=%d, metadata_kv_size=%d",
-            version, tensor_count, metadata_kv_size,
+            version,
+            tensor_count,
+            metadata_kv_size,
         )
 
         if version < 1 or version > GGUF_VERSION_MAX:
-            raise NotImplementedError(
-                f"GGUF version {version} — this parser handles v1-v3"
-            )
+            raise NotImplementedError(f"GGUF version {version} — this parser handles v1-v3")
 
         if version == 1:
-            # GGUF v1: tensors appear before metadata
             raise NotImplementedError(
-                "GGUF v1 tensor-before-metadata not supported; "
-                "use v2 or v3 files"
+                "GGUF v1 tensor-before-metadata not supported; use v2 or v3 files"
             )
 
         # --- Parse metadata KV pairs (offset 24 for v2/v3) ---
@@ -381,8 +395,6 @@ def open_gguf(path: str | Path) -> GGUFFile:
             tensors[name] = info
 
         # --- Compute tensor data start (aligned to GGML_DEFAULT_ALIGNMENT) ---
-        # GGUF v3 spec: tensor data starts at the next GGML_DEFAULT_ALIGNMENT
-        # boundary after the end of the tensor info table.
         tensor_data_offset = (
             (offset + GGML_DEFAULT_ALIGNMENT - 1) // GGML_DEFAULT_ALIGNMENT
         ) * GGML_DEFAULT_ALIGNMENT
@@ -397,9 +409,7 @@ def open_gguf(path: str | Path) -> GGUFFile:
             _file_size=file_size,
         )
 
-        # Log summary
-        logger.info("Parsed %d tensors (data offset=%d)",
-                    len(tensors), tensor_data_offset)
+        logger.info("Parsed %d tensors (data offset=%d)", len(tensors), tensor_data_offset)
         quant_counts: dict[str, int] = {}
         for info in tensors.values():
             tname = GGML_TYPE_NAMES.get(info.ggml_type, f"type_{info.ggml_type}")
@@ -410,7 +420,6 @@ def open_gguf(path: str | Path) -> GGUFFile:
         return result
 
     except Exception:
-        # Ensure mmap is cleaned up on error
         buf.close()
         raise
 
@@ -433,12 +442,11 @@ def get_tensor_bytes(gguf: GGUFFile, tensor_name: str) -> memoryview:
     if info is None:
         available = "\n  ".join(sorted(gguf.tensors.keys()))
         raise KeyError(
-            f"Tensor {tensor_name!r} not found in GGUF file. "
-            f"Available tensors:\n  {available}"
+            f"Tensor {tensor_name!r} not found in GGUF file. Available tensors:\n  {available}"
         )
 
     start = gguf.tensor_data_offset + info.offset
-    return memoryview(gguf._mmap)[start:start + info.n_bytes]
+    return memoryview(gguf._mmap)[start : start + info.n_bytes]
 
 
 # ---------------------------------------------------------------------------
@@ -456,14 +464,10 @@ def dequantize_q4_0(data: memoryview) -> torch.Tensor:
     Returns torch.float16 tensor of shape (n_elements,).
     """
     raw = torch.frombuffer(data, dtype=torch.uint8)
-    n_blocks = (raw.shape[0] + 17) // 18   # ceil division for safety
+    n_blocks = (raw.shape[0] + 17) // 18
 
-    # Slice into blocks: each block is 18 bytes
-    # Handle the raw data as (n_blocks, 18)
-    block_data = raw[:n_blocks * 18].view(-1, 18)
+    block_data = raw[: n_blocks * 18].view(-1, 18)
 
-    # Scales: bytes 0-1 of each block, reinterpreted as float16
-    # Use struct for the scale since torch cannot reinterpret uint8→float16 on CPU
     scales_list = []
     for i in range(n_blocks):
         scale_bytes = bytes(block_data[i, :2].tolist())
@@ -471,13 +475,12 @@ def dequantize_q4_0(data: memoryview) -> torch.Tensor:
         scales_list.append(scale)
     scales = torch.tensor(scales_list, dtype=torch.float16, device="cpu")  # (B,)
 
-    # Quantised nibbles: bytes 2-17 of each block
     nibbles_packed = block_data[:, 2:]  # (B, 16) uint8
-    low = nibbles_packed & 0x0F        # (B, 16) — low nibbles (Q4[0], Q4[2], ...)
-    high = (nibbles_packed >> 4) & 0x0F  # (B, 16) — high nibbles (Q4[1], Q4[3], ...)
-    values = torch.stack([low, high], dim=2).reshape(n_blocks, 32)  # (B, 32)
-    values = values.to(torch.float16) - 8.0  # center around 8
-    values = values * scales.unsqueeze(1)      # scale each block
+    low = nibbles_packed & 0x0F
+    high = (nibbles_packed >> 4) & 0x0F
+    values = torch.stack([low, high], dim=2).reshape(n_blocks, 32)
+    values = values.to(torch.float16) - 8.0
+    values = values * scales.unsqueeze(1)
     return values.flatten()
 
 
@@ -493,9 +496,8 @@ def dequantize_q8_0(data: memoryview) -> torch.Tensor:
     raw = torch.frombuffer(data, dtype=torch.uint8)
     n_blocks = (raw.shape[0] + 33) // 34
 
-    block_data = raw[:n_blocks * 34].view(-1, 34)
+    block_data = raw[: n_blocks * 34].view(-1, 34)
 
-    # Scales
     scales_list = []
     for i in range(n_blocks):
         scale_bytes = bytes(block_data[i, :2].tolist())
@@ -503,10 +505,8 @@ def dequantize_q8_0(data: memoryview) -> torch.Tensor:
         scales_list.append(scale)
     scales = torch.tensor(scales_list, dtype=torch.float16, device="cpu")
 
-    # Quantised int8 values
-    qs = block_data[:, 2:].to(torch.float16)  # (B, 32) uint8 → fp16
-    # Reinterpret: uint8 0..255 stored at int8 0..127,-128..-1
-    qs = torch.where(qs >= _INT8_BIAS, qs - 256, qs)  # convert to signed
+    qs = block_data[:, 2:].to(torch.float16)
+    qs = torch.where(qs >= _INT8_BIAS, qs - 256, qs)
     qs = qs * scales.unsqueeze(1)
     return qs.flatten()
 
@@ -516,29 +516,34 @@ def dequantize_q8_0(data: memoryview) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def load_tensor(
+def load_tensor_mmap_zero_copy(
     gguf: GGUFFile,
     tensor_name: str,
-    device: str | torch.device = "cpu",
+    device: str | torch.device = "cuda",
 ) -> torch.Tensor:
-    """Load a single GGUF tensor into a PyTorch tensor.
+    """Load a single GGUF tensor into a PyTorch tensor — zero-copy path.
 
-    Supports F32 (zero-copy), F16 (zero-copy), Q4_0, Q8_0.
-    Quantized types are dequantised using pure-PyTorch kernels.
+    For F32 / F16 tensors this creates a CPU view via ``torch.frombuffer``
+    directly from the mmap and then transfers to the target device.
+    The mmap is kept alive by the global registry so the view never
+    goes stale.
+
+    Quantized types (Q4_0, Q8_0) are dequantised on CPU then moved;
+    these are unavoidably copies.
 
     Parameters
     ----------
     gguf : GGUFFile
-        Opened GGUF file.
+        Opened GGUF file (mmap held in _MMAP_REGISTRY).
     tensor_name : str
         Tensor name (e.g. ``"blk.0.attn_q.weight"``).
     device : str | torch.device
-        Target device (default: ``"cpu"``).
+        Target device (default: ``"cuda"``).
 
     Returns
     -------
     torch.Tensor
-        Dequantised tensor in FP16 on the target device.
+        FP16 tensor on the target device.
     """
     info = gguf.tensors.get(tensor_name)
     if info is None:
@@ -546,32 +551,24 @@ def load_tensor(
 
     data = get_tensor_bytes(gguf, tensor_name)
 
-    # --- Unquantized: zero-copy via torch.frombuffer ---
-    # Note: for CPU, clone() after reshape to decouple from the mmap.
-    # Without clone(), the tensor shares storage with the mmap and
-    # prevents mmap.close().  On CUDA, .to(device) implicitly copies.
-    _need_clone = device in ("cpu",) or torch.device(device).type == "cpu"
-
     if info.ggml_type == GGML_TYPE_F32:
-        tensor = torch.frombuffer(
-            data, dtype=torch.float32
-        ).reshape(info.dims).to(device=device, dtype=torch.float16)
+        tensor = (
+            torch.frombuffer(data, dtype=torch.float32)
+            .reshape(info.dims)
+            .to(device=device, dtype=torch.float16)
+        )
+        return tensor
 
     elif info.ggml_type == GGML_TYPE_F16:
-        tensor = torch.frombuffer(
-            data, dtype=torch.float16
-        ).reshape(info.dims).to(device=device)
+        return torch.frombuffer(data, dtype=torch.float16).reshape(info.dims).to(device=device)
 
-    # --- Quantized: pure-PyTorch dequant ---
     elif info.ggml_type == GGML_TYPE_Q4_0:
         flat = dequantize_q4_0(data)
-        tensor = flat.reshape(info.dims).to(device=device)
-        _need_clone = False  # dequant already created new tensor
+        return flat.reshape(info.dims).to(device=device)
 
     elif info.ggml_type == GGML_TYPE_Q8_0:
         flat = dequantize_q8_0(data)
-        tensor = flat.reshape(info.dims).to(device=device)
-        _need_clone = False  # dequant already created new tensor
+        return flat.reshape(info.dims).to(device=device)
 
     else:
         raise NotImplementedError(
@@ -579,12 +576,69 @@ def load_tensor(
             f"({GGML_TYPE_NAMES.get(info.ggml_type, '?')}) not yet supported"
         )
 
+
+def load_tensor(
+    gguf: GGUFFile,
+    tensor_name: str,
+    device: str | torch.device = "cpu",
+) -> torch.Tensor:
+    """Load a single GGUF tensor into a PyTorch tensor (CPU-safe path).
+
+    Supports F32 (zero-copy), F16 (zero-copy), Q4_0, Q8_0.
+    Quantized types are dequantised using pure-PyTorch kernels.
+
+    Parameters
+    ----------
+    gguf : GGUFFile
+    tensor_name : str
+        Tensor name.
+    device : str | torch.device
+        Target device (default: ``"cpu"``).
+
+    Returns
+    -------
+    torch.Tensor
+        FP16 tensor on the target device.
+    """
+    info = gguf.tensors.get(tensor_name)
+    if info is None:
+        raise KeyError(f"Tensor {tensor_name!r} not found")
+
+    data = get_tensor_bytes(gguf, tensor_name)
+
+    _need_clone = device in ("cpu",) or torch.device(device).type == "cpu"
+
+    if info.ggml_type == GGML_TYPE_F32:
+        tensor = (
+            torch.frombuffer(data, dtype=torch.float32)
+            .reshape(info.dims)
+            .to(device=device, dtype=torch.float16)
+        )
+    elif info.ggml_type == GGML_TYPE_F16:
+        tensor = torch.frombuffer(data, dtype=torch.float16).reshape(info.dims).to(device=device)
+    elif info.ggml_type == GGML_TYPE_Q4_0:
+        flat = dequantize_q4_0(data)
+        tensor = flat.reshape(info.dims).to(device=device)
+        _need_clone = False
+    elif info.ggml_type == GGML_TYPE_Q8_0:
+        flat = dequantize_q8_0(data)
+        tensor = flat.reshape(info.dims).to(device=device)
+        _need_clone = False
+    else:
+        raise NotImplementedError(
+            f"GGML type {info.ggml_type} "
+            f"({GGML_TYPE_NAMES.get(info.ggml_type, '?')}) not yet supported"
+        )
+
     if _need_clone:
-        tensor = tensor.clone()  # detach from mmap storage
+        tensor = tensor.clone()
 
     logger.debug(
         "Loaded tensor %s: dtype=%s, shape=%s, device=%s",
-        tensor_name, tensor.dtype, tuple(tensor.shape), device,
+        tensor_name,
+        tensor.dtype,
+        tuple(tensor.shape),
+        device,
     )
     return tensor
 
@@ -594,26 +648,30 @@ def load_tensor(
 # ---------------------------------------------------------------------------
 
 
+def load_all_tensors_zero_copy(
+    gguf: GGUFFile,
+    device: str | torch.device = "cuda",
+    tensor_filter: str | None = None,
+) -> dict[str, torch.Tensor]:
+    """Load all tensors using the zero-copy mmap path.
+
+    See :func:`load_tensor_mmap_zero_copy` for details.
+    """
+    result: dict[str, torch.Tensor] = {}
+    for name in gguf.tensors:
+        if tensor_filter and tensor_filter not in name:
+            continue
+        logger.info("Loading tensor (mmap): %s ...", name)
+        result[name] = load_tensor_mmap_zero_copy(gguf, name, device=device)
+    return result
+
+
 def load_all_tensors(
     gguf: GGUFFile,
     device: str | torch.device = "cuda",
     tensor_filter: str | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Load all tensors from a GGUF file into a dictionary.
-
-    Parameters
-    ----------
-    gguf : GGUFFile
-    device : str | torch.device
-    tensor_filter : str | None
-        If given, only load tensors whose name contains this substring
-        (e.g. ``"attn_q"``).
-
-    Returns
-    -------
-    Dict[str, torch.Tensor]
-        Tensor name → FP16 tensor on target device.
-    """
+    """Load all tensors using the standard path."""
     result: dict[str, torch.Tensor] = {}
     for name in gguf.tensors:
         if tensor_filter and tensor_filter not in name:
@@ -624,7 +682,7 @@ def load_all_tensors(
 
 
 # ---------------------------------------------------------------------------
-# High-level model loading API (replaces HuggingFace AutoModelForCausalLM)
+# High-level model loading API
 # ---------------------------------------------------------------------------
 
 
@@ -644,11 +702,10 @@ def load_model(
         Path to the ``.gguf`` model file.
     dtype : str
         Target internal dtype: ``"fp16"`` (default), ``"bf16"``, or ``"fp32"``.
-        All dequantised weights are stored in this dtype.
     device : str
         Target device (default: ``"cuda"``).
     block_size : int
-        KV cache block size (recommended: 32 for GGUF models >7B, 16 otherwise).
+        KV cache block size.
 
     Returns
     -------

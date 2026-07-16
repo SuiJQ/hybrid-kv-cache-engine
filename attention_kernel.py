@@ -47,7 +47,9 @@ class FlashAttentionKernel:
         """
         try:
             return torch.nn.functional.scaled_dot_product_attention(
-                q, k, v,
+                q,
+                k,
+                v,
                 scale=softmax_scale,
                 is_causal=causal,
                 enable_gqa=True,
@@ -55,7 +57,9 @@ class FlashAttentionKernel:
         except (RuntimeError, ValueError):
             # PyTorch < 2.6 or non-GQA head counts may reject enable_gqa.
             return torch.nn.functional.scaled_dot_product_attention(
-                q, k, v,
+                q,
+                k,
+                v,
                 scale=softmax_scale,
                 is_causal=causal,
             )

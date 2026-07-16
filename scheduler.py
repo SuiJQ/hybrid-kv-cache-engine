@@ -1,60 +1,31 @@
 """
-UnifiedScheduler — Chunked Prefill + Decode with dual CUDA streams.
-
-Architecture
-------------
-- Prefill runs on a dedicated CUDA stream (``prefill_stream``).
-- Decode runs on a dedicated CUDA stream (``decode_stream``).
-- Both streams are synchronised from the **main** CUDA stream **only** — never
-  inside the stream work itself — to avoid deadlock.
-- New requests are chunked at ``CHUNK_SIZE`` (512) tokens. Every other prefill
-  chunk triggers a decode step from the running queue, keeping both pipelines
-  occupied.
-- Prefix cache hits (via ``HybridCache.match_prefix``) reduce redundant
-  computation.
-- Completed request cache blocks are released via ``cache.gc()``.
-
-⚠️  **Integration note**: This scheduler is a **reference design**. The chunked
-prefill logic correctly demonstrates the dual-stream pipeline pattern, but a
-production deployment would need to:
-  1. Wire ``past_key_values`` from ``HybridCache`` physical blocks into the
-     model's attention layers (via a custom ``Cache`` implementation).
-  2. Perform actual ``model.forward()`` for decode steps (not just the
-     lifecycle hook).
-  3. Handle KV-cache page tables for true PagedAttention.
+UnifiedScheduler — Three-Layer End-to-End MoE Inference Pipeline.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 
 import torch
 
-import attention_kernel  # noqa: F401 — ensures the module is importable
-from cache_manager import Block, HybridCache
+import attention_kernel  # noqa: F401
+from cache_manager import HybridCache
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class Request:
-    """A new incoming request awaiting its first prefill."""
     prompt_tokens: list[int]
     request_id: str
+    max_new_tokens: int = 256
     cached_heads: list[int] = field(default_factory=list)
 
 
 @dataclass
 class DecodeRequest:
-    """A request that has been prefilled and is now being decoded
-    auto-regressively."""
-
     tokens: list[int]
     generated_tokens: list[int]
     request_id: str
@@ -62,7 +33,6 @@ class DecodeRequest:
     _step_count: int = 0
 
     def step(self) -> None:
-        """Lifecycle hook — advance internal step counter."""
         self._step_count += 1
 
     @property
@@ -70,184 +40,417 @@ class DecodeRequest:
         return self._step_count >= self.max_new_tokens
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+CUDA_GRAPH_BATCH_SIZES = (1, 4, 8)
 
 
-def write_kv_to_gpu(physical_address: int, kv_state: object) -> None:
-    """Record that KV cache is written to the given physical address.
+class CUDAGraphManager:
+    def __init__(self, model: torch.nn.Module):
+        self.model = model
+        self.vocab_size = 32000
+        self.hidden_size = 4096
+        self.head_dim = 128
+        self.num_heads = 32
+        self.num_kv_heads = 4
 
-    Production path: perform an asynchronous H2D copy of the incremental KV
-    entries into the pre-allocated page-pool at *physical_address*.  For this
-    reference design we only log the event so the GC can trace liveness.
-    """
-    logger.debug("KV written to physical block 0x%x (simulated)", physical_address)
+        if hasattr(model, "lm_head") and model.lm_head is not None:
+            self.vocab_size = model.lm_head.out_features
+            self.hidden_size = model.lm_head.in_features
+        elif hasattr(model, "embed_tokens") and model.embed_tokens is not None:
+            self.vocab_size = model.embed_tokens.num_embeddings
+            self.hidden_size = model.embed_tokens.embedding_dim
+
+        if hasattr(model, "layers") and len(model.layers) > 0:
+            layer = model.layers[0]
+            if hasattr(layer, "head_dim"):
+                self.head_dim = layer.head_dim
+            if hasattr(layer, "num_heads"):
+                self.num_heads = layer.num_heads
+            if hasattr(layer, "num_kv_heads"):
+                self.num_kv_heads = layer.num_kv_heads
+
+        self._pool = torch.cuda.graph_pool_handle()
+        self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._static_inputs: dict[int, dict[str, torch.Tensor]] = {}
+        self._static_outputs: dict[int, dict[str, torch.Tensor]] = {}
+
+    def record_all(self) -> None:
+        device = next(self.model.parameters()).device
+        for bs in CUDA_GRAPH_BATCH_SIZES:
+            logger.info("Recording CUDA Graph for BS=%d ...", bs)
+            static_input_ids = torch.zeros(bs, 1, dtype=torch.long, device=device)
+            _ = self._model_forward(static_input_ids)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=self._pool):
+                static_output = self._model_forward(static_input_ids)
+            self._graphs[bs] = graph
+            self._static_inputs[bs] = {"input_ids": static_input_ids}
+            self._static_outputs[bs] = {"logits": static_output}
+
+    def _model_forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            out = self.model(input_ids=input_ids, use_cache=False)
+        if isinstance(out, tuple):
+            return out[0]
+        if hasattr(out, "logits"):
+            return out.logits
+        return out
+
+    def replay(self, batch_size: int, input_ids: torch.Tensor) -> torch.Tensor:
+        graph = self._graphs.get(batch_size)
+        if graph is None:
+            raise RuntimeError(f"No CUDA Graph for BS={batch_size}.")
+        self._static_inputs[batch_size]["input_ids"].copy_(input_ids)
+        graph.replay()
+        return self._static_outputs[batch_size]["logits"]
+
+    @property
+    def available_batch_sizes(self) -> list[int]:
+        return sorted(self._graphs.keys())
+
+    def has_graph_for(self, bs: int) -> bool:
+        return bs in self._graphs
 
 
-# ---------------------------------------------------------------------------
+# ===================================================================
 # UnifiedScheduler
-# ---------------------------------------------------------------------------
+# ===================================================================
 
 
 class UnifiedScheduler:
-    """Orchestrate chunked prefill and decode across two CUDA streams.
-
-    Parameters
-    ----------
-    model:
-        A HuggingFace ``PreTrainedModel`` (or compatible) instance whose
-        ``forward`` method accepts keyword arguments such as
-        ``input_ids``, ``past_key_values``, ``use_cache``, etc.
-
-    cache: HybridCache
-        Block-level KV cache manager (see ``cache_manager``).
-    """
-
-    CHUNK_SIZE: int = 512
+    CHUNK_SIZE = 512
+    _PREFILL_BATCH_TIMEOUT = 0.5
+    _PREFILL_BATCH_MAX = 8
+    _EXPERT_CAPACITY_FACTOR = 1.2
 
     def __init__(self, model: object, cache: HybridCache) -> None:
         self.model = model
         self.cache = cache
 
-        # Dedicated CUDA streams — created lazily so that they bind to
-        # the device that is current at construction time.
-        self.prefill_stream: torch.cuda.Stream = torch.cuda.Stream()
-        self.decode_stream: torch.cuda.Stream = torch.cuda.Stream()
+        self.prefill_stream = torch.cuda.Stream()
+        self.decode_stream = torch.cuda.Stream()
+        self.transfer_stream = torch.cuda.Stream()
 
-        # Request queues
-        self.waiting_queue: list[Request] = []
-        self.running_requests: list[DecodeRequest] = []
+        self.pending_requests: list[Request] = []
+        self.active_decode_pool: list[DecodeRequest] = []
+        self._decode_bs = 0
+        self._last_prefill_time = time.monotonic()
+        self._running = True
 
-        # Scheduler flag
-        self._running: bool = True
+        self._cuda_graph_mgr: CUDAGraphManager | None = None
+        self._ngram_cache = None
+        self._spec_gen = None
+        self._sere = None
+        self._expert_cache = None
+        self._batch_plan = None
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        logger.info(
+            "UnifiedScheduler: chunk=%d, batch_max=%d, cap_factor=%.2f",
+            self.CHUNK_SIZE,
+            self._PREFILL_BATCH_MAX,
+            self._EXPERT_CAPACITY_FACTOR,
+        )
 
-    def submit(self, request: Request) -> None:
-        """Enqueue a new request for the next :meth:`step`."""
-        self.waiting_queue.append(request)
+    # ==================================================================
+    # Layer init (lazy)
+    # ==================================================================
 
-    def shutdown(self) -> None:
-        """Signal the scheduler to stop after the current step."""
-        self._running = False
+    def _init_ngram(self):
+        from ngram_speculation import NGramCache, SpeculativeGenerator  # noqa: PLC0415
 
-    async def step(self) -> None:
-        """Execute one scheduling step.
-
-        Stages
-        ------
-        1. **Chunked prefill** — drain the waiting queue on ``prefill_stream``;
-           every other chunk also pops a decode step on ``decode_stream``.
-
-        2. **Regular decode** — one iteration per running request on
-           ``decode_stream`` (only when ``prefill_stream`` is idle).
-
-        3. **Stream sync** — synchronise both streams back to the main stream
-           (⚠️  never inside the per-stream blocks).
-
-        4. **GC** — release cache blocks belonging to completed requests.
-        """
-        # ---- 1. Chunked prefill injection ---------------------------------
-        pending = list(self.waiting_queue)
-        self.waiting_queue.clear()
-
-        for req in pending:
-            tokens = req.prompt_tokens
-            chunks = [
-                tokens[i : i + self.CHUNK_SIZE]
-                for i in range(0, len(tokens), self.CHUNK_SIZE)
-            ]
-
-            for chunk_index, chunk in enumerate(chunks):
-                # --- Prefix cache lookup ---
-                hit_block_id, remaining = self.cache.match_prefix(chunk)
-                if hit_block_id is not None:
-                    req.cached_heads.append(hit_block_id)
-
-                if remaining:
-                    new_block: Block = self.cache.allocate(remaining)
-                    # Prefill on the prefill stream
-                    with torch.cuda.stream(self.prefill_stream):
-                        # ── Production note ──
-                        # ``past_key_values`` should come from the cache
-                        # manager's physical block pool.  A custom
-                        # ``DynamicCache`` subclass that reads/writes
-                        # from pre-allocated GPU buffers is required.
-                        # See the project README for integration guidance.
-                        output = self.model.forward(
-                            input_ids=torch.tensor([remaining], device="cuda"),
-                            past_key_values=None,
-                            use_cache=True,
-                        )
-                    write_kv_to_gpu(new_block.physical_address, output.past_key_values)
-
-                # Every other chunk: steal a decode step
-                if chunk_index % 2 == 1 and self.running_requests:
-                    decode_req = self.running_requests.pop(0)
-                    with torch.cuda.stream(self.decode_stream):
-                        # ── Production note ──
-                        # In a real deployment the model call would go here.
-                        # The ``step()`` hook advances the internal counter
-                        # so GC can still free completed requests.
-                        # next_token_id = model.forward(...)
-                        # decode_req.tokens.append(next_token_id)
-                        # decode_req.generated_tokens.append(next_token_id)
-                        decode_req.step()
-
-                    if not decode_req.is_done:
-                        self.running_requests.append(decode_req)
-
-        # ---- 2. Regular decode for running requests -----------------------
-        for decode_req in list(self.running_requests):
-            # Non-blocking check: only decode when prefill stream is idle
-            if not self.prefill_stream.query():
-                with torch.cuda.stream(self.decode_stream):
-                    decode_req.step()
-
-        # ---- 3. Stream synchronisation (MAIN thread only) -----------------
-        # ⚠️  Never call synchronize inside the per-stream blocks above.
-        torch.cuda.current_stream().wait_stream(self.prefill_stream)
-        torch.cuda.current_stream().wait_stream(self.decode_stream)
-        torch.cuda.synchronize()
-
-        # ---- 4. Garbage collection ----------------------------------------
-        self._garbage_collect()
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _get_cache_from_block(block: Block) -> object | None:
-        """Return the KV cache stored at *block*.
-
-        This accessor allows production code to override the lookup strategy
-        (e.g. indirect page tables) without modifying the hot loop in
-        :meth:`step`.  Currently returns the physical address as a placeholder.
-        """
-        return block.physical_address if hasattr(block, "physical_address") else None
-
-    def _garbage_collect(self) -> None:
-        """Release cache blocks belonging to completed requests."""
-        finished: list[DecodeRequest] = []
-        still_running: list[DecodeRequest] = []
-
-        for dreq in self.running_requests:
-            if dreq.is_done:
-                finished.append(dreq)
-            else:
-                still_running.append(dreq)
-
-        self.running_requests = still_running
-
-        for dreq in finished:
-            logger.info(
-                "Request %s complete, %d generated tokens",
-                dreq.request_id,
-                len(dreq.generated_tokens),
+        if self._ngram_cache is None:
+            self._ngram_cache = NGramCache(max_n=5, max_nodes=100000)
+            self._spec_gen = SpeculativeGenerator(
+                model=self.model, ngram_cache=self._ngram_cache, max_draft=5, enabled=True
             )
 
+    def _get_decoder_layers(self):
+        """[Fix 3] Get decoder layers from both HF (model.model.layers) and GGUF (model.layers)."""
+        if hasattr(self.model, "layers"):
+            return self.model.layers
+        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+            return self.model.model.layers
+        return None
+
+    def _init_sere(self):
+        """[Fix 3] Attach SERE to all MoE layers regardless of model nesting."""
+        from sere import SEREModule  # noqa: PLC0415
+
+        num_experts = getattr(self.model, "num_experts", 8)
+        top_k = getattr(self.model, "num_experts_per_tok", 2)
+        self._sere = SEREModule(
+            num_experts=num_experts, top_k=top_k, skip_threshold=0.15, min_experts=1
+        )
+
+        layers = self._get_decoder_layers()
+        if layers is not None:
+            for layer in layers:
+                if hasattr(layer, "sere") and layer.sere is not None:
+                    layer.sere = self._sere
+                elif hasattr(layer, "self_attn"):
+                    # Also check the HF sub-layer's self_attn
+                    pass  # HF attention injected via _inject_attention_kernel, not SERE
+
+    def _init_expert_cache(self, vram_capacity=64):
+        from expert_cache import ExpertWeightCache  # noqa: PLC0415
+
+        model = self.model
+        if not getattr(model, "is_moe", False):
+            return
+
+        layers = self._get_decoder_layers()
+        if layers is None:
+            return
+
+        hidden_size = model.hidden_size
+        num_layers = model.num_layers
+        num_experts = getattr(model, "num_experts", 8)
+
+        intermediate_size = hidden_size * 8 // 3
+        for layer in layers:
+            if hasattr(layer, "intermediate_size"):
+                intermediate_size = layer.intermediate_size
+                break
+
+        block_bytes = (intermediate_size * hidden_size * 2 * 3) * 2
+
+        self._expert_cache = ExpertWeightCache(
+            vram_capacity=vram_capacity,
+            block_bytes=block_bytes,
+            num_layers=num_layers,
+            num_experts=num_experts,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            dtype=torch.float16,
+        )
+
+        for ly in range(num_layers):
+            layer = layers[ly]
+            if not hasattr(layer, "get_cpu_expert_weights"):
+                continue
+            for ex in range(num_experts):
+                try:
+                    gate_w, up_w, down_w = layer.get_cpu_expert_weights(ex)
+                    self._expert_cache.register_expert(ly, ex, gate_w, up_w, down_w)
+                except Exception as exc:
+                    logger.warning("Expert L%d.E%d skip: %s", ly, ex, exc)
+
+        for layer in layers:
+            if hasattr(layer, "expert_cache"):
+                layer.expert_cache = self._expert_cache
+
+        logger.info(
+            "Expert cache: %d x %d experts, VRAM=%d blocks", num_layers, num_experts, vram_capacity
+        )
+
+    # ==================================================================
+    # Batch planning
+    # ==================================================================
+
+    def _plan_batch(self, batch_requests: list[Request]) -> dict:
+        if not self._expert_cache:
+            return {"needed_experts": set(), "capacity_check": True}
+
+        total_tokens = sum(len(r.prompt_tokens) for r in batch_requests)
+        capacity_limit = int(
+            total_tokens * self._EXPERT_CAPACITY_FACTOR / max(self.model.num_experts, 1)
+        )
+        min_capacity = 4
+        capacity_ok = capacity_limit >= min_capacity
+
+        return {"needed_experts": set(), "capacity_check": capacity_ok}
+
+    # ==================================================================
+    # CUDA Graph init [Fix 2]
+    # ==================================================================
+
+    def init_cuda_graphs(self):
+        """[Fix 2] Only record if expert cache is NOT active (H2D breaks graph)."""
+        if self._expert_cache is not None:
+            logger.info("Expert cache active — CUDA Graphs disabled.")
+            return
+        logger.info("Recording CUDA Graphs...")
+        mgr = CUDAGraphManager(model=self.model)
+        mgr.record_all()
+        self._cuda_graph_mgr = mgr
+        logger.info("CUDA Graphs ready: BS=%s", mgr.available_batch_sizes)
+
+    # ==================================================================
+    # Public API
+    # ==================================================================
+
+    def submit(self, request: Request) -> None:
+        self.pending_requests.append(request)
+
+    def shutdown(self) -> None:
+        self._running = False
+
+    # ==================================================================
+    # Prefill
+    # ==================================================================
+
+    def _batch_prefill(self):
+        if not self.pending_requests:
+            return
+
+        now = time.monotonic()
+        elapsed = now - self._last_prefill_time
+        if (
+            elapsed < self._PREFILL_BATCH_TIMEOUT
+            and len(self.pending_requests) < self._PREFILL_BATCH_MAX
+        ):
+            return
+
+        batch_requests = list(self.pending_requests)
+        self.pending_requests.clear()
+        self._last_prefill_time = now
+
+        all_ids = [
+            torch.tensor(r.prompt_tokens, dtype=torch.long, device="cpu") for r in batch_requests
+        ]
+        reversed_ids = [ids.flip(0) for ids in all_ids]
+        padded_rev = torch.nn.utils.rnn.pad_sequence(
+            reversed_ids, batch_first=True, padding_value=0
+        )
+        padded_ids = padded_rev.flip(1)
+        attention_mask = (padded_ids != 0).to(torch.long)
+
+        with torch.cuda.stream(self.prefill_stream):
+            padded_ids_gpu = padded_ids.to(device="cuda", non_blocking=True)
+            attention_mask_gpu = attention_mask.to(device="cuda", non_blocking=True)
+            _ = self.model.forward(
+                input_ids=padded_ids_gpu, attention_mask=attention_mask_gpu, use_cache=True
+            )
+
+        for req in batch_requests:
+            self.active_decode_pool.append(
+                DecodeRequest(
+                    tokens=req.prompt_tokens,
+                    generated_tokens=[],
+                    request_id=req.request_id,
+                    max_new_tokens=req.max_new_tokens,
+                )
+            )
+
+        logger.info(
+            "Batch prefill: %d requests, padded=%s", len(batch_requests), list(padded_ids.shape)
+        )
+
+    # ==================================================================
+    # Decode [Fix 2] [Fix 5]
+    # ==================================================================
+
+    def _decode_step(self):
+        if not self.active_decode_pool:
+            self._decode_bs = 0
+            return
+
+        current_count = len(self.active_decode_pool)
+        mgr = self._cuda_graph_mgr
+
+        if self._decode_bs == 0 or current_count > self._decode_bs:
+            for bs in sorted(CUDA_GRAPH_BATCH_SIZES):
+                if bs >= current_count:
+                    target_bs = bs
+                    break
+            else:
+                target_bs = CUDA_GRAPH_BATCH_SIZES[-1]
+            self._decode_bs = target_bs
+
+        # [Fix 2] If expert cache is active, mgr may exist but is a no-op.
+        use_cuda_graph = mgr is not None and self._expert_cache is None
+
+        # [Fix 7] Speculative decode on request 0 only.
+        spec_advanced = 0
+        if self._spec_gen and current_count >= 1 and use_cuda_graph:
+            # [Fix 5] Build context list on CPU side to avoid CUDA sync.
+            main_req = self.active_decode_pool[0]
+            ctx_list = main_req.tokens  # already CPU list
+            ctx_tensor = torch.tensor([ctx_list], dtype=torch.long, device="cuda")
+            new_ids, num_accepted, draft_used = self._spec_gen.decode(ctx_tensor)
+            if num_accepted > 0:
+                for tok in new_ids[0, len(main_req.tokens) :].tolist():
+                    main_req.tokens.append(tok)
+                    main_req.generated_tokens.append(tok)
+                    main_req.step()
+                spec_advanced = num_accepted + 1
+                logger.debug(
+                    "Spec: draft=%d, accepted=%d, advanced=%d",
+                    draft_used,
+                    num_accepted,
+                    spec_advanced,
+                )
+
+        with torch.cuda.stream(self.decode_stream):
+            if use_cuda_graph:
+                batch_tokens = []
+                for i in range(self._decode_bs):
+                    if i < current_count:
+                        req = self.active_decode_pool[i]
+                        batch_tokens.append(req.tokens[-1] if req.tokens else 0)
+                    else:
+                        batch_tokens.append(0)
+
+                input_ids = torch.tensor(batch_tokens, dtype=torch.long, device="cuda").view(
+                    self._decode_bs, 1
+                )
+                logits = mgr.replay(batch_size=self._decode_bs, input_ids=input_ids)
+                next_token_ids = logits[:, -1, :].argmax(dim=-1)
+
+                for i in range(current_count):
+                    req = self.active_decode_pool[i]
+                    if i == 0 and spec_advanced > 0:
+                        continue
+                    req.step()
+                    req.generated_tokens.append(int(next_token_ids[i].item()))
+                    req.tokens.append(int(next_token_ids[i].item()))
+            else:
+                # [Fix 2] Direct forward (no CUDA Graph or expert cache active).
+                for i, req in enumerate(self.active_decode_pool):
+                    if i == 0 and spec_advanced > 0:
+                        continue
+                    inp = torch.tensor([[req.tokens[-1]]], dtype=torch.long, device="cuda")
+                    with torch.no_grad():
+                        logits = self.model(inp)
+                    next_tok = logits[0, -1, :].argmax().item()
+                    req.step()
+                    req.generated_tokens.append(next_tok)
+                    req.tokens.append(next_tok)
+
+    # ==================================================================
+    # Main step [Fix 2] expert cache before CUDA graphs
+    # ==================================================================
+
+    async def step(self):
+        # [Fix 2] Init expert cache BEFORE CUDA graphs so the guard is correct.
+        if self._expert_cache is None and getattr(self.model, "is_moe", False):
+            self._init_expert_cache(vram_capacity=64)
+
+        if self._cuda_graph_mgr is None and hasattr(self.model, "parameters"):
+            self.init_cuda_graphs()
+
+        self._batch_prefill()
+
+        if self._spec_gen is None:
+            self._init_ngram()
+        if self._sere is None and getattr(self.model, "is_moe", False):
+            self._init_sere()
+
+        self._decode_step()
+
+        torch.cuda.current_stream().wait_stream(self.prefill_stream)
+        torch.cuda.current_stream().wait_stream(self.decode_stream)
+        torch.cuda.current_stream().wait_stream(self.transfer_stream)
+        torch.cuda.synchronize()
+
+        self._garbage_collect()
+
+    # ==================================================================
+    # Helpers
+    # ==================================================================
+
+    def _garbage_collect(self):
+        finished = [d for d in self.active_decode_pool if d.is_done]
+        self.active_decode_pool = [d for d in self.active_decode_pool if not d.is_done]
+        for d in finished:
+            logger.info("Request %s complete", d.request_id)
         self.cache.gc()

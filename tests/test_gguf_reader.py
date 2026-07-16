@@ -58,15 +58,33 @@ class TestBinaryReaders:
     @pytest.fixture
     def buf(self):
         """Create a memoryview of known little-endian bytes."""
-        data = array.array("B", [
-            0x00,  # uint8: 0
-            0xFF,  # uint8: 255
-            0x10, 0x00,  # uint16 LE: 16
-            0xFF, 0x7F,  # int16 LE: 32767
-            0x78, 0x56, 0x34, 0x12,  # uint32 LE: 0x12345678
-            0x38, 0xB4, 0x96, 0x49,  # float32 LE: 1234567.0
-            0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01,  # uint64 LE: 0x0123456789ABCDEF
-        ])
+        data = array.array(
+            "B",
+            [
+                0x00,  # uint8: 0
+                0xFF,  # uint8: 255
+                0x10,
+                0x00,  # uint16 LE: 16
+                0xFF,
+                0x7F,  # int16 LE: 32767
+                0x78,
+                0x56,
+                0x34,
+                0x12,  # uint32 LE: 0x12345678
+                0x38,
+                0xB4,
+                0x96,
+                0x49,  # float32 LE: 1234567.0
+                0xEF,
+                0xCD,
+                0xAB,
+                0x89,
+                0x67,
+                0x45,
+                0x23,
+                0x01,  # uint64 LE: 0x0123456789ABCDEF
+            ],
+        )
         return memoryview(bytes(data))
 
     def test_read_uint8(self, buf):
@@ -125,12 +143,12 @@ class TestMetadataReader:
         return memoryview(payload)
 
     def test_uint8(self):
-        val, n = _read_metadata_value(memoryview(b"\x2A"), 0, 0)
+        val, n = _read_metadata_value(memoryview(b"\x2a"), 0, 0)
         assert val == 42
         assert n == 1
 
     def test_int8(self):
-        val, n = _read_metadata_value(memoryview(b"\xFE"), 0, 1)
+        val, n = _read_metadata_value(memoryview(b"\xfe"), 0, 1)
         assert val == -2
         assert n == 1
 
@@ -234,8 +252,7 @@ class TestDequantQ40:
         assert result.shape == (32,)
         assert result.dtype == torch.float16
         # Should approximately match
-        assert torch.allclose(result, torch.tensor(values, dtype=torch.float16),
-                              atol=0.3)
+        assert torch.allclose(result, torch.tensor(values, dtype=torch.float16), atol=0.3)
 
     def test_single_block_linear(self):
         """Linearly increasing values."""
@@ -286,8 +303,7 @@ class TestDequantQ80:
         result = dequantize_q8_0(memoryview(data))
         assert result.shape == (32,)
         assert result.dtype == torch.float16
-        assert torch.allclose(result, torch.tensor(values, dtype=torch.float16),
-                              atol=0.1)
+        assert torch.allclose(result, torch.tensor(values, dtype=torch.float16), atol=0.1)
 
     def test_single_block_negative(self):
         values = [float(i - 16) for i in range(32)]
@@ -395,7 +411,9 @@ def _create_minimal_gguf_bytes(
     ) * GGML_DEFAULT_ALIGNMENT
     padding_needed = aligned_start - pre_tensor_size
 
-    return bytes(header + meta_section + tensor_info) + b"\x00" * padding_needed + bytes(tensor_body)
+    return (
+        bytes(header + meta_section + tensor_info) + b"\x00" * padding_needed + bytes(tensor_body)
+    )
 
 
 class TestSmallGgufFile:
