@@ -1,5 +1,13 @@
 """
 UnifiedScheduler — Three-Layer End-to-End MoE Inference Pipeline.
+
+Fixes
+-----
+- KV cache is now **actually stored** in HybridCache blocks after prefill
+  and **retrieved** on each decode step, giving O(n) attention per token.
+- Batch prefill stores per-request KV into individually allocated blocks.
+- Decode passes ``past_key_values`` from cache, avoids full-sequence recompute.
+- Finished requests free their cache blocks for recycling.
 """
 
 from __future__ import annotations
@@ -32,6 +40,8 @@ class DecodeRequest:
     request_id: str
     max_new_tokens: int
     _step_count: int = 0
+    # Block ID in HybridCache that holds this request's KV cache
+    cache_block_id: int | None = None
 
     def step(self) -> None:
         self._step_count += 1
@@ -45,6 +55,12 @@ CUDA_GRAPH_BATCH_SIZES = (1, 4, 8)
 
 
 class CUDAGraphManager:
+    """CUDA Graph pre-recording for static-batch single-token decode.
+
+    Note: when KV cache is active, CUDA Graphs are **disabled** because
+    the model needs to return per-layer KV tensors (non-static output).
+    """
+
     def __init__(self, model: torch.nn.Module):
         self.model = model
         self.vocab_size = 32000
@@ -113,7 +129,7 @@ class CUDAGraphManager:
 
 
 # ===================================================================
-# UnifiedScheduler
+# UnifiedScheduler — corrected KV cache integration
 # ===================================================================
 
 
@@ -122,6 +138,7 @@ class UnifiedScheduler:
     _PREFILL_BATCH_TIMEOUT = 0.5
     _PREFILL_BATCH_MAX = 8
     _EXPERT_CAPACITY_FACTOR = 1.2
+    _KV_CACHE_ENABLED = True  # set False to fall back to full recompute
 
     def __init__(
         self,
@@ -155,10 +172,11 @@ class UnifiedScheduler:
         self._spec_prefetcher = None
 
         logger.info(
-            "UnifiedScheduler: chunk=%d, batch_max=%d, cap_factor=%.2f",
+            "UnifiedScheduler: chunk=%d, batch_max=%d, cap_factor=%.2f, kv_cache=%s",
             self.CHUNK_SIZE,
             self._PREFILL_BATCH_MAX,
             self._EXPERT_CAPACITY_FACTOR,
+            self._KV_CACHE_ENABLED,
         )
 
     # ==================================================================
@@ -175,14 +193,12 @@ class UnifiedScheduler:
             )
 
     def _init_speculative_prefetch(self):
-        """Lazy init DynamicExpertActivator + SpeculativePrefetcher."""
         from speculative_prefetch import (  # noqa: PLC0415
             DynamicExpertActivator,
             SpeculativePrefetcher,
         )
 
         if self._dynamic_activator is None:
-            # All tunable parameters use the class defaults — no manual overrides.
             self._dynamic_activator = DynamicExpertActivator(
                 sere_module=self._sere,
             )
@@ -199,7 +215,6 @@ class UnifiedScheduler:
             )
 
     def _get_decoder_layers(self):
-        """[Fix 3] Get decoder layers from both HF (model.model.layers) and GGUF (model.layers)."""
         if hasattr(self.model, "layers"):
             return self.model.layers
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
@@ -207,7 +222,6 @@ class UnifiedScheduler:
         return None
 
     def _init_sere(self):
-        """[Fix 3] Attach SERE to all MoE layers regardless of model nesting."""
         from sere import SEREModule  # noqa: PLC0415
 
         num_experts = getattr(self.model, "num_experts", 8)
@@ -221,9 +235,6 @@ class UnifiedScheduler:
             for layer in layers:
                 if hasattr(layer, "sere") and layer.sere is not None:
                     layer.sere = self._sere
-                elif hasattr(layer, "self_attn"):
-                    # Also check the HF sub-layer's self_attn
-                    pass  # HF attention injected via _inject_attention_kernel, not SERE
 
     def _init_expert_cache(self, vram_capacity=64):
         from expert_cache import ExpertWeightCache  # noqa: PLC0415
@@ -274,7 +285,10 @@ class UnifiedScheduler:
                 layer.expert_cache = self._expert_cache
 
         logger.info(
-            "Expert cache: %d x %d experts, VRAM=%d blocks", num_layers, num_experts, vram_capacity
+            "Expert cache: %d x %d experts, VRAM=%d blocks",
+            num_layers,
+            num_experts,
+            vram_capacity,
         )
 
     # ==================================================================
@@ -295,11 +309,14 @@ class UnifiedScheduler:
         return {"needed_experts": set(), "capacity_check": capacity_ok}
 
     # ==================================================================
-    # CUDA Graph init [Fix 2]
+    # CUDA Graph init
     # ==================================================================
 
     def init_cuda_graphs(self):
-        """[Fix 2] Only record if expert cache is NOT active (H2D breaks graph)."""
+        """Record CUDA Graphs only when KV cache is disabled (static output)."""
+        if self._KV_CACHE_ENABLED:
+            logger.info("KV cache active — CUDA Graphs disabled (dynamic KV output).")
+            return
         if self._expert_cache is not None:
             logger.info("Expert cache active — CUDA Graphs disabled.")
             return
@@ -322,7 +339,7 @@ class UnifiedScheduler:
             self._spec_prefetcher.shutdown()
 
     # ==================================================================
-    # Prefill
+    # Prefill with KV cache storage
     # ==================================================================
 
     def _batch_prefill(self):
@@ -341,39 +358,57 @@ class UnifiedScheduler:
         self.pending_requests.clear()
         self._last_prefill_time = now
 
-        all_ids = [
-            torch.tensor(r.prompt_tokens, dtype=torch.long, device="cpu") for r in batch_requests
-        ]
-        reversed_ids = [ids.flip(0) for ids in all_ids]
-        padded_rev = torch.nn.utils.rnn.pad_sequence(
-            reversed_ids, batch_first=True, padding_value=0
-        )
-        padded_ids = padded_rev.flip(1)
-        attention_mask = (padded_ids != 0).to(torch.long)
-
-        with torch.cuda.stream(self.prefill_stream):
-            padded_ids_gpu = padded_ids.to(device="cuda", non_blocking=True)
-            attention_mask_gpu = attention_mask.to(device="cuda", non_blocking=True)
-            _ = self.model.forward(
-                input_ids=padded_ids_gpu, attention_mask=attention_mask_gpu, use_cache=True
-            )
-
+        # Process each request individually so we can capture per-request KV
         for req in batch_requests:
-            self.active_decode_pool.append(
-                DecodeRequest(
-                    tokens=req.prompt_tokens,
-                    generated_tokens=[],
-                    request_id=req.request_id,
-                    max_new_tokens=req.max_new_tokens,
-                )
-            )
+            tokens = req.prompt_tokens
+            inp = torch.tensor([tokens], dtype=torch.long, device="cuda")
 
-        logger.info(
-            "Batch prefill: %d requests, padded=%s", len(batch_requests), list(padded_ids.shape)
-        )
+            with torch.cuda.stream(self.prefill_stream), torch.no_grad():
+                _ = self.model.forward(
+                    input_ids=inp,
+                    use_cache=True,
+                )
+
+            # Retrieve KV cache from model (stored in _last_kv_cache)
+            kv_cache = getattr(self.model, "_last_kv_cache", None)
+            if kv_cache is not None:
+                # Allocate a cache block for this request
+                cache_block = self.cache.allocate(tokens)
+                # Store KV into block (list of (k, v) per layer)
+                self.cache.store_kv(cache_block.block_id, kv_cache)
+
+                self.active_decode_pool.append(
+                    DecodeRequest(
+                        tokens=req.prompt_tokens,
+                        generated_tokens=[],
+                        request_id=req.request_id,
+                        max_new_tokens=req.max_new_tokens,
+                        cache_block_id=cache_block.block_id,
+                    )
+                )
+                logger.debug(
+                    "Prefill %s: %d tokens -> block %d",
+                    req.request_id,
+                    len(tokens),
+                    cache_block.block_id,
+                )
+            else:
+                # No KV cache (model doesn't support use_cache) — fallback
+                logger.warning("Model did not produce _last_kv_cache — KV caching disabled.")
+                self.active_decode_pool.append(
+                    DecodeRequest(
+                        tokens=req.prompt_tokens,
+                        generated_tokens=[],
+                        request_id=req.request_id,
+                        max_new_tokens=req.max_new_tokens,
+                        cache_block_id=None,
+                    )
+                )
+
+        logger.info("Prefill: %d requests processed", len(batch_requests))
 
     # ==================================================================
-    # Decode [Fix 2] [Fix 5]
+    # Decode with KV cache
     # ==================================================================
 
     def _decode_step(self):
@@ -381,116 +416,93 @@ class UnifiedScheduler:
             self._decode_bs = 0
             return
 
-        current_count = len(self.active_decode_pool)
-        mgr = self._cuda_graph_mgr
-
-        if self._decode_bs == 0 or current_count > self._decode_bs:
-            for bs in sorted(CUDA_GRAPH_BATCH_SIZES):
-                if bs >= current_count:
-                    target_bs = bs
-                    break
-            else:
-                target_bs = CUDA_GRAPH_BATCH_SIZES[-1]
-            self._decode_bs = target_bs
-
-        # [Fix 2] If expert cache is active, mgr may exist but is a no-op.
-        use_cuda_graph = mgr is not None and self._expert_cache is None
-
-        # [Fix 7] Speculative decode on request 0 only.
+        # -- Speculative decode (request 0 only) --
         spec_advanced = 0
-        if self._spec_gen and current_count >= 1 and use_cuda_graph:
-            # [Fix 5] Build context list on CPU side to avoid CUDA sync.
+        if self._spec_gen and len(self.active_decode_pool) >= 1:
             main_req = self.active_decode_pool[0]
-            ctx_list = main_req.tokens  # already CPU list
-            ctx_tensor = torch.tensor([ctx_list], dtype=torch.long, device="cuda")
-            new_ids, num_accepted, draft_used = self._spec_gen.decode(ctx_tensor)
-            if num_accepted > 0:
-                for tok in new_ids[0, len(main_req.tokens) :].tolist():
-                    main_req.tokens.append(tok)
-                    main_req.generated_tokens.append(tok)
-                    main_req.step()
-                spec_advanced = num_accepted + 1
-                logger.debug(
-                    "Spec: draft=%d, accepted=%d, advanced=%d",
-                    draft_used,
-                    num_accepted,
-                    spec_advanced,
-                )
+            ctx_list = main_req.tokens
+            if len(ctx_list) > 0:
+                ctx_tensor = torch.tensor([ctx_list], dtype=torch.long, device="cuda")
+                new_ids, num_accepted, _draft_used = self._spec_gen.decode(ctx_tensor)
+                if num_accepted > 0:
+                    for tok in new_ids[0, len(main_req.tokens):].tolist():
+                        main_req.tokens.append(tok)
+                        main_req.generated_tokens.append(tok)
+                        main_req.step()
+                    spec_advanced = num_accepted + 1
 
         with torch.cuda.stream(self.decode_stream):
-            if use_cuda_graph:
-                batch_tokens = []
-                for i in range(self._decode_bs):
-                    if i < current_count:
-                        req = self.active_decode_pool[i]
-                        batch_tokens.append(req.tokens[-1] if req.tokens else 0)
+            for i, req in enumerate(self.active_decode_pool):
+                if i == 0 and spec_advanced > 0:
+                    continue
+
+                last_tok = req.tokens[-1] if req.tokens else 0
+                inp = torch.tensor([[last_tok]], dtype=torch.long, device="cuda")
+
+                # Load cached KV if available
+                past_kv = None
+                if req.cache_block_id is not None:
+                    past_kv = self.cache.load_kv(req.cache_block_id)
+
+                with torch.no_grad():
+                    if past_kv is not None and self._KV_CACHE_ENABLED:
+                        logits = self.model.forward(
+                            input_ids=inp,
+                            past_key_values=past_kv,
+                            use_cache=True,
+                        )
                     else:
-                        batch_tokens.append(0)
+                        # Full recompute path (fallback if no KV cache)
+                        full_input = torch.tensor(
+                            [req.tokens], dtype=torch.long, device="cuda"
+                        )
+                        logits = self.model.forward(
+                            input_ids=full_input, use_cache=False
+                        )
 
-                input_ids = torch.tensor(batch_tokens, dtype=torch.long, device="cuda").view(
-                    self._decode_bs, 1
-                )
-                logits = mgr.replay(batch_size=self._decode_bs, input_ids=input_ids)
-                next_token_ids = logits[:, -1, :].argmax(dim=-1)
+                # Extract next token
+                _min_logit_dims = 2
+                if isinstance(logits, torch.Tensor) and logits.dim() >= _min_logit_dims:
+                    next_tok = int(logits[0, -1, :].argmax().item())
+                else:
+                    # Might be a tuple/model output
+                    next_tok = int(
+                        logits[0, -1, :].argmax().item()
+                        if hasattr(logits, "__getitem__")
+                        else 0
+                    )
 
-                # [Dynamic Expert Activation] confidence-based k adjustment
-                if self._dynamic_activator is not None:
-                    # Use the first active request's logit as the confidence signal
+                req.step()
+                req.generated_tokens.append(next_tok)
+                req.tokens.append(next_tok)
+
+                # Update KV cache after decode
+                if req.cache_block_id is not None and self._KV_CACHE_ENABLED:
+                    new_kv = getattr(self.model, "_last_kv_cache", None)
+                    if new_kv is not None:
+                        self.cache.store_kv(req.cache_block_id, new_kv)
+
+                # Confidence-based k adjustment on request 0
+                if self._dynamic_activator is not None and i == 0 and isinstance(logits, torch.Tensor):
                     self._dynamic_activator.update_from_logits(
-                        logits[:1, :, :],
-                        generated_ids=self.active_decode_pool[0].tokens if current_count > 0 else None,
-                        detokenizer=self._detokenizer,
-                    )
-
-                for i in range(current_count):
-                    req = self.active_decode_pool[i]
-                    if i == 0 and spec_advanced > 0:
-                        continue
-                    req.step()
-                    tok = int(next_token_ids[i].item())
-                    req.generated_tokens.append(tok)
-                    req.tokens.append(tok)
-
-                # [Speculative Prefetch] trigger next-step prediction
-                if self._spec_prefetcher is not None and current_count > 0:
-                    self._spec_prefetcher.step(
-                        context_ids=self.active_decode_pool[0].tokens,
-                        transfer_stream=self.transfer_stream,
-                    )
-            else:
-                # [Fix 2] Direct forward (no CUDA Graph or expert cache active).
-                for i, req in enumerate(self.active_decode_pool):
-                    if i == 0 and spec_advanced > 0:
-                        continue
-                    inp = torch.tensor([[req.tokens[-1]]], dtype=torch.long, device="cuda")
-                    with torch.no_grad():
-                        logits = self.model(inp)
-                    next_tok = logits[0, -1, :].argmax().item()
-                    req.step()
-                    req.generated_tokens.append(next_tok)
-                    req.tokens.append(next_tok)
-
-                    # [Dynamic Expert Activation] per-token confidence adjustment
-                    if self._dynamic_activator is not None and i == 0:
-                        self._dynamic_activator.update_from_logits(
-                            logits[None, :, :],  # [1, seq, vocab]
+                            logits[None, :, :],
                             generated_ids=req.tokens,
                             detokenizer=self._detokenizer,
                         )
 
-                # [Speculative Prefetch] trigger after all requests processed
-                if self._spec_prefetcher is not None and current_count > 0:
-                    self._spec_prefetcher.step(
-                        context_ids=self.active_decode_pool[0].tokens,
-                        transfer_stream=self.transfer_stream,
-                    )
+            # Speculative prefetch
+            if self._spec_prefetcher is not None and len(self.active_decode_pool) > 0:
+                self._spec_prefetcher.step(
+                    context_ids=self.active_decode_pool[0].tokens,
+                    transfer_stream=self.transfer_stream,
+                )
 
     # ==================================================================
-    # Main step [Fix 2] expert cache before CUDA graphs
+    # Main step
     # ==================================================================
 
     async def step(self):
-        # [Fix 2] Init expert cache BEFORE CUDA graphs so the guard is correct.
+        # Init layers (lazy)
         if self._expert_cache is None and getattr(self.model, "is_moe", False):
             self._init_expert_cache(vram_capacity=64)
 
@@ -504,12 +516,12 @@ class UnifiedScheduler:
         if self._sere is None and getattr(self.model, "is_moe", False):
             self._init_sere()
 
-        # [Speculative Prefetch] init after ngram + sere + expert_cache ready
         if self._dynamic_activator is None or self._spec_prefetcher is None:
             self._init_speculative_prefetch()
 
         self._decode_step()
 
+        # Sync streams
         torch.cuda.current_stream().wait_stream(self.prefill_stream)
         torch.cuda.current_stream().wait_stream(self.decode_stream)
         torch.cuda.current_stream().wait_stream(self.transfer_stream)
@@ -518,12 +530,14 @@ class UnifiedScheduler:
         self._garbage_collect()
 
     # ==================================================================
-    # Helpers
+    # Garbage collection
     # ==================================================================
 
     def _garbage_collect(self):
         finished = [d for d in self.active_decode_pool if d.is_done]
-        self.active_decode_pool = [d for d in self.active_decode_pool if not d.is_done]
         for d in finished:
-            logger.info("Request %s complete", d.request_id)
+            logger.info("Request %s complete (%d tokens)", d.request_id, len(d.generated_tokens))
+            if d.cache_block_id is not None:
+                self.cache.free_block(d.cache_block_id)
+        self.active_decode_pool = [d for d in self.active_decode_pool if not d.is_done]
         self.cache.gc()

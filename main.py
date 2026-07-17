@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Pure Python Inference Engine — Main Entry Point (MoE-first)
+Pure Python Inference Engine — MoE-first Inference Server with HTTP API.
 
 Usage:
-    python main.py --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-    python main.py --gguf path/to/model.gguf
+    python main.py --model Qwen/Qwen2.5-1.5B-Instruct
+    python main.py --gguf models/Model.gguf
+    python main.py --gguf models/Model.gguf --api-port 8000
 """
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -16,12 +17,13 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import signal
 import sys
 
 import torch
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,17 +81,9 @@ except ImportError:
 # Stage 4: Model loading & kernel injection
 # ---------------------------------------------------------------------------
 
-# [Bug 5] USE_COMPILE is informational only — the scheduler's CUDAGraphManager
-# auto-detects whether to use pre-recorded graphs vs direct forward.
-USE_COMPILE: bool = True
-
 
 def _inject_attention_kernel(layer: torch.nn.Module) -> None:
-    """Replace ``self_attn.forward`` with compiled flash SDPA kernel.
-
-    Works for both dense and MoE (Mixtral/Qwen2-MoE/etc.) models since
-    attention structure is identical.
-    """
+    """Replace ``self_attn.forward`` with compiled flash SDPA kernel."""
     from attention_kernel import FlashAttentionKernel  # noqa: PLC0415
 
     attn = getattr(layer, "self_attn", None)
@@ -132,39 +126,44 @@ def _inject_attention_kernel(layer: torch.nn.Module) -> None:
 
     attn.forward = _patched_forward
     attn.is_causal = True
-    logger.debug("Injected FlashAttentionKernel into layer %s", type(layer).__name__)
 
 
 def _try_compile_model(
     model: torch.nn.Module,
     dummy_input: torch.Tensor,
 ) -> torch.nn.Module:
-    """Attempt torch.compile with fallback chain.
-
-    Returns the compiled model if successful, else the original model.
-    Sets global USE_COMPILE accordingly.
-    """
-    global USE_COMPILE
-
+    """Attempt torch.compile with fallback chain."""
     for mode, fullgraph in [("reduce-overhead", True), ("default", False)]:
         try:
             compiled = torch.compile(model, mode=mode, fullgraph=fullgraph, dynamic=False)
             with torch.no_grad():
                 compiled(dummy_input)
             logger.info("torch.compile success (mode=%s, fullgraph=%s)", mode, fullgraph)
-            USE_COMPILE = True
             return compiled
         except Exception as exc:
-            logger.warning("torch.compile (mode=%s, fullgraph=%s) failed: %s", mode, fullgraph, exc)
+            logger.warning(
+                "torch.compile (mode=%s, fullgraph=%s) failed: %s", mode, fullgraph, exc
+            )
 
-    logger.info("torch.compile permanently disabled — using raw model + CUDA Graphs")
-    USE_COMPILE = False
+    logger.info("torch.compile permanently disabled — using raw model")
     return model
 
 
-def load_and_inject_model(model_name: str) -> torch.nn.Module:
-    """Load HF model, inject attention kernels, attempt compile."""
+def load_and_inject_model(
+    model_name: str, load_tokenizer: bool = False
+) -> tuple[torch.nn.Module, object | None]:
+    """Load HF model, inject attention kernels, attempt compile.
+
+    Returns (model, tokenizer_or_None)."""
     logger.info("Loading HuggingFace model: %s ...", model_name)
+
+    tokenizer = None
+    if load_tokenizer:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            logger.info("Tokenizer loaded")
+        except Exception as exc:
+            logger.warning("Tokenizer load failed: %s", exc)
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -181,15 +180,13 @@ def load_and_inject_model(model_name: str) -> torch.nn.Module:
     else:
         logger.warning("Could not locate model.model.layers; attention injection skipped.")
 
-    # [Step 2] Warmup + torch.compile fallback chain
     dummy_input = torch.randint(0, 1000, (1, 64), device="cuda")
     with torch.no_grad():
         model(dummy_input)
 
     model = _try_compile_model(model, dummy_input)
-
-    logger.info("HuggingFace model loaded (USE_COMPILE=%s).", USE_COMPILE)
-    return model
+    logger.info("HuggingFace model loaded.")
+    return model, tokenizer
 
 
 def load_and_inject_gguf_model(
@@ -198,7 +195,6 @@ def load_and_inject_gguf_model(
     block_size: int | None = None,
 ) -> torch.nn.Module:
     """Load model from GGUF file via mmap zero-copy path."""
-
     if not _HAS_GGUF:
         raise ImportError("model_loader not available.")
 
@@ -223,7 +219,6 @@ def load_and_inject_gguf_model(
             block_size,
         )
 
-    # [Step 2] Warmup + torch.compile fallback chain
     dummy_input = torch.randint(0, 1000, (1, 64), device="cuda")
     with torch.no_grad():
         model(dummy_input)
@@ -231,38 +226,28 @@ def load_and_inject_gguf_model(
     model = _try_compile_model(model, dummy_input)
 
     logger.info(
-        "GGUF model loaded: %d layers, %.1fB params, is_moe=%s, USE_COMPILE=%s",
+        "GGUF model loaded: %d layers, %.1fB params, is_moe=%s",
         model.num_layers,
         est_params,
         getattr(model, "is_moe", False),
-        USE_COMPILE,
     )
     return model
 
 
 # ---------------------------------------------------------------------------
-# Stage 5: Main async loop
+# Stage 5: Main async loop with HTTP API
 # ---------------------------------------------------------------------------
-
-
-def _setup_signal_handlers(scheduler: UnifiedScheduler) -> None:
-    def _signal_handler(signum, frame):
-        logger.info("Received signal %d, shutting down gracefully...", signum)
-        scheduler.shutdown()
-
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Pure Python Inference Engine — Hybrid Paged+Radix KV Cache"
+        description="MoeOwner — MoE Inference Engine with HTTP API"
     )
     parser.add_argument(
         "--model",
         type=str,
         default=os.environ.get("MODEL_NAME", ""),
-        help="HuggingFace model name or local path to GGUF file",
+        help="HuggingFace model name",
     )
     parser.add_argument(
         "--gguf",
@@ -280,13 +265,25 @@ async def main() -> None:
         "--hidden-size",
         type=int,
         default=4096,
-        help="Hidden dimension (default: 4096)",
+        help="Hidden dimension (for HF model metadata fallback)",
     )
     parser.add_argument(
         "--total-blocks",
         type=int,
         default=None,
         help="Override automatic GPU-memory-based block count",
+    )
+    parser.add_argument(
+        "--api-port",
+        type=int,
+        default=8000,
+        help="HTTP API server port (default: 8000, 0 to disable)",
+    )
+    parser.add_argument(
+        "--api-host",
+        type=str,
+        default="0.0.0.0",
+        help="HTTP API server bind address (default: 0.0.0.0)",
     )
     parser.add_argument(
         "--verbose",
@@ -299,6 +296,8 @@ async def main() -> None:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    # ---- Load model ----
+    tokenizer = None
     if args.gguf or (args.model and args.model.endswith(".gguf")):
         gguf_path = args.gguf or args.model
         model = load_and_inject_gguf_model(
@@ -309,19 +308,49 @@ async def main() -> None:
         model_hidden_size = model.hidden_size
         block_size = args.block_size or model.block_size
     else:
-        model = load_and_inject_model(args.model)
+        model, tokenizer = load_and_inject_model(args.model, load_tokenizer=(args.api_port > 0))
         model_hidden_size = args.hidden_size
         block_size = args.block_size or 16
 
+    # ---- Create cache & scheduler ----
     cache = HybridCache(
         block_size=block_size,
         hidden_size=model_hidden_size,
         total_blocks=args.total_blocks,
     )
-    scheduler = UnifiedScheduler(model, cache)
-    _setup_signal_handlers(scheduler)
+    scheduler = UnifiedScheduler(
+        model,
+        cache,
+        detokenizer=tokenizer.decode if tokenizer is not None else None,
+    )
 
-    logger.info("Engine running. Press Ctrl+C to stop.")
+    # ---- Signal handling ----
+    def _signal_handler(signum, frame):
+        logger.info("Received signal %d, shutting down gracefully...", signum)
+        scheduler.shutdown()
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    # ---- Start API server (if enabled) ----
+    api_task = None
+    if args.api_port > 0:
+        from api_server import run_api_server  # noqa: PLC0415
+
+        api_task = asyncio.create_task(
+            run_api_server(
+                scheduler=scheduler,
+                host=args.api_host,
+                port=args.api_port,
+                tokenizer_decoder=tokenizer,
+            )
+        )
+    else:
+        logger.info("API server disabled (--api-port=0). Running engine loop only.")
+
+    # ---- Engine loop (drives scheduler periodically) ----
+    logger.info("Engine running.")
+
     try:
         while scheduler._running:
             await scheduler.step()
@@ -329,6 +358,11 @@ async def main() -> None:
     except asyncio.CancelledError:
         pass
     finally:
+        scheduler.shutdown()
+        if api_task is not None and not api_task.done():
+            api_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await api_task
         logger.info("Engine stopped.")
 
 

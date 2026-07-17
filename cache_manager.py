@@ -13,6 +13,8 @@ import hashlib
 import logging
 from array import array
 
+import torch
+
 logger = logging.getLogger(__name__)
 
 
@@ -95,6 +97,9 @@ class HybridCache:
         self._match_cache_max = 256
 
         self._prefetch_stream: object | None = None
+
+        # BlockID → KV payload cache (list of (k_tensor, v_tensor) per layer)
+        self._block_kv_cache: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = {}
 
         logger.info(
             "HybridCache initialized: block_size=%d, total_blocks=%d, mem_frac=%.2f",
@@ -322,6 +327,34 @@ class HybridCache:
             logger.warning("_try_prefetch_children unexpected error: %s", _eexc)
 
     # ------------------------------------------------------------------
+    # KV cache storage / retrieval
+    # ------------------------------------------------------------------
+
+    def store_kv(
+        self,
+        block_id: int,
+        layer_kv_pairs: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        """Store per-layer KV tensors for a block.
+
+        *layer_kv_pairs* is ``[(k_0, v_0), (k_1, v_1), ...]`` — one per
+        decoder layer.  Tensors should already be on CUDA.
+        Note: References to these tensors must remain alive until
+        ``free_block`` is called.  The caller should NOT hold extra
+        references after storage to allow GC to reclaim.
+        """
+        self._block_kv_cache[block_id] = layer_kv_pairs
+        block = self.allocated_blocks.get(block_id)
+        if block is not None:
+            block.kv_tensor = layer_kv_pairs
+
+    def load_kv(
+        self, block_id: int
+    ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
+        """Retrieve stored per-layer KV tensors for a block, or None."""
+        return self._block_kv_cache.get(block_id)
+
+    # ------------------------------------------------------------------
     # Free / reference-count management
     # ------------------------------------------------------------------
 
@@ -347,6 +380,7 @@ class HybridCache:
         if block.ref_count <= 0:
             free.append(block_id)
             blocks.pop(block_id, None)
+            self._block_kv_cache.pop(block_id, None)
             stale = [h for h, bids in radix.items() if block_id in bids]
             for h in stale:
                 radix[h].discard(block_id)
