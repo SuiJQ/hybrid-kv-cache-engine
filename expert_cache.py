@@ -344,19 +344,42 @@ class ExpertWeightCache:
     # Async H2D prefetch
     # ------------------------------------------------------------------
 
+    def _prefetch_evict_one_lru(self) -> int | None:
+        """Evict the least recently used (oldest access_time) expert block."""
+        if self.vram_cache.used == 0:
+            return None
+        oldest_id: int | None = None
+        oldest_time = float("inf")
+        for bid, block in self.vram_cache.allocated.items():
+            if block.last_access_time < oldest_time:
+                oldest_time = block.last_access_time
+                oldest_id = bid
+        if oldest_id is not None:
+            self.vram_cache.free(oldest_id)
+            self.hash_index.remove_by_block(oldest_id)
+        return oldest_id
+
     def prefetch_expert(
         self,
         layer_idx: int,
         expert_idx: int,
         stream: torch.cuda.Stream | None = None,
     ) -> None:
-        """Prefetch an expert's weights from DRAM to VRAM (non-blocking)."""
+        """Prefetch an expert's weights from DRAM to VRAM (non-blocking).
+
+        [Plan 3] LRU eviction when reserved pool is full; update timestamp
+        for already-loaded experts.
+        """
         key = self._expert_key(layer_idx, expert_idx)
-        if self.hash_index.lookup(key) is not None:
+        existing_bid = self.hash_index.lookup(key)
+        if existing_bid is not None:
+            block = self.vram_cache.get(existing_bid)
+            if block is not None:
+                block.last_access_time = time.monotonic()
             return
 
         if self.vram_cache.free_count == 0:
-            return
+            self._prefetch_evict_one_lru()
 
         ly = layer_idx
         ex = expert_idx
@@ -380,7 +403,7 @@ class ExpertWeightCache:
 
         self.hash_index.insert(key, block.block_id)
         block.access_count = 0
-        block.last_access_time = self._now
+        block.last_access_time = time.monotonic()
 
     # ------------------------------------------------------------------
     # Helpers

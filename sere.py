@@ -42,6 +42,11 @@ class SEREModule:
     ) -> tuple[torch.Tensor, torch.Tensor, None]:
         """Apply SERE to router probabilities.
 
+        [OEF] If ``self._oef_skip_suggestions`` is set (a ``set[int]`` of
+        expert IDs), SERE additionally skips experts in that set, treating
+        the OEF suggestion as an extra signal.  SERE retains absolute veto
+        power — call ``clear_suggestions()`` on the OEF controller to reset.
+
         Returns (selected_probs, selected_indices, aux_loss).
         """
         b_size, t_len, _num_e = router_probs.shape
@@ -51,9 +56,23 @@ class SEREModule:
 
         keep_mask = torch.ones_like(top_k_probs, dtype=torch.bool)
 
-        for k in range(self.min_experts, self.top_k):
-            skip = gap_1_2 > self.skip_threshold
-            keep_mask[..., k] = ~skip
+        # OEF: additional skip signal
+        oef_suggestions: set[int] | None = getattr(self, '_oef_skip_suggestions', None)
+        if oef_suggestions and len(oef_suggestions) > 0:
+            oef_device = top_k_indices.device
+            for k in range(self.min_experts, self.top_k):
+                expert_ids = top_k_indices[..., k]  # (B, T)
+                oef_mask = torch.zeros_like(gap_1_2, dtype=torch.bool)
+                for e in oef_suggestions:
+                    oef_mask = oef_mask | (expert_ids == e)
+                # Merge with gap-based skip: skip if gap large OR OEF suggests
+                gap_skip = gap_1_2 > self.skip_threshold
+                skip_combined = gap_skip | oef_mask
+                keep_mask[..., k] = ~skip_combined
+        else:
+            for k in range(self.min_experts, self.top_k):
+                skip = gap_1_2 > self.skip_threshold
+                keep_mask[..., k] = ~skip
 
         masked_probs = top_k_probs * keep_mask.to(top_k_probs.dtype)
         norm = masked_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)

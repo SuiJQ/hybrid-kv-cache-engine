@@ -19,9 +19,6 @@ from __future__ import annotations
 
 import collections
 import logging
-import time
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as _TimeoutError
 
 import torch
 
@@ -205,90 +202,68 @@ class DynamicExpertActivator:
 
 
 class SpeculativePrefetcher:
-    """Predictive expert-weight prefetcher with hard 5 ms timeout.
+    """Expert weight prefetcher via dedicated CUDA stream.
 
-    Architecture
-    ------------
-    1. **Prediction phase** — uses the existing ``NGramCache`` to draft
-       the most likely next token(s), then consults SERE's routing
-       heuristics to estimate which experts those tokens would activate.
-    2. **Prefetch phase** — issues async H2D transfers for the predicted
-       expert(s) via ``ExpertWeightCache.prefetch_expert()`` on a
-       background thread.
-    3. **Timeout guard** — every prefetch call has a 5 ms wall-clock
-       budget. If it exceeds that, the result is **silently dropped**
-       and the next on-demand ``get_or_load_expert()`` will serve the
-       normal path.  The prefetch thread continues in the background but
-       its results are never waited on.
+    [Plan 3] Architecture
+    ---------------------
+    1. **Trigger** — called at the end of each decode step, reads router
+       logits saved by each ``MoEDecoderLayer`` during model forward.
+    2. **Prediction** — for each layer N, uses its router probs to predict
+       the top 2 most-activated experts; those are the experts most likely
+       needed by layer N+1 on the next step (exploiting temporal locality).
+    3. **Prefetch** — issues async H2D copies on a dedicated CUDA stream
+       for the predicted experts into the reserved VRAM pool.  The next
+       decode step's model forward runs in parallel with these transfers.
+    4. **Synchronization** — before each layer's MoE computation, the
+       layer synchronises the prefetch stream; if the expert is not yet
+       ready, the existing ``get_or_load_expert()`` call loads it
+       synchronously (rare fallback).
 
-    Note: this is a **heuristic** — it provides speed-up on average
-    without any correctness cost.
+    Benefits
+    --------
+    - No thread pool, no timeout-based dropping.
+    - Fully pipelined: H2D transfers overlap with the next step's
+      attention computation.
+    - Zero correctness risk: fallback to synchronous load if prefetch
+      hasn't completed.
     """
 
-    PREFETCH_TIMEOUT_S: float = 0.005  # 5 ms
+    NUM_HOT_EXPERTS: int = 2
 
     def __init__(
         self,
-        ngram_cache,
         expert_cache,
-        sere_module,
+        decoder_layers,
         num_layers: int,
         num_experts: int,
-        prefetch_depth: int = 2,
-        prefetch_layers_per_step: int = 1,
+        num_reserved_experts: int = 32,
     ) -> None:
-        self._ngram = ngram_cache
         self._expert_cache = expert_cache
-        self._sere = sere_module
+        self._decoder_layers = decoder_layers
         self._num_layers = num_layers
         self._num_experts = num_experts
-        self._prefetch_depth = prefetch_depth
-        self._prefetch_layers = prefetch_layers_per_step
+        self._num_reserved = num_reserved_experts
 
-        # A single-worker thread pool — one prefetch in flight at a time
-        # avoids queue pile-up on bursty decode steps.
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        # Dedicated CUDA stream for async H2D prefetch transfers
+        self._prefetch_stream = torch.cuda.Stream(priority=-1)
 
-        # Tracks expert usage history for heuristic prediction
-        # token_hash -> set of (layer, expert) tuples
-        self._token_expert_history: dict[int, list[tuple[int, int]]] = {}
-        self._history_max: int = 200
+        # Register the prefetch stream on every decoder layer
+        for ly in decoder_layers:
+            if hasattr(ly, '_prefetch_stream'):
+                ly._prefetch_stream = self._prefetch_stream
+
+        # Global timestamp array for LRU eviction tracking
+        # Accessed through expert_cache._prefetch_evict_one_lru
 
         logger.info(
-            "SpeculativePrefetcher: layers=%d, experts=%d, depth=%d, timeout=%.1fms",
-            num_layers,
-            num_experts,
-            prefetch_depth,
-            self.PREFETCH_TIMEOUT_S * 1000,
+            "SpeculativePrefetcher [Plan 3]: %d layers x %d experts, "
+            "reserved_pool=%d, stream_priority=-1",
+            num_layers, num_experts, num_reserved_experts,
         )
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-
-    def record_expert_usage(
-        self,
-        token_ids: list[int],
-        router_selections: list[tuple[int, int]],
-    ) -> None:
-        """Record which experts were activated for the current context.
-
-        Called *after* each decode step.  The recorded history is used
-        by *predict_needed_experts* to correlate future token patterns
-        with expert demand.
-        """
-        if not token_ids:
-            return
-        # Use the last token as the key
-        last_tok = token_ids[-1]
-        record = list(router_selections)
-
-        if last_tok not in self._token_expert_history:
-            if len(self._token_expert_history) >= self._history_max:
-                # Simple LRU-ish eviction
-                oldest = next(iter(self._token_expert_history))
-                del self._token_expert_history[oldest]
-            self._token_expert_history[last_tok] = record
 
     def step(
         self,
@@ -296,140 +271,39 @@ class SpeculativePrefetcher:
         transfer_stream: torch.cuda.Stream | None = None,
         token_hash: int | None = None,
     ) -> None:
-        """Perform one speculative prefetch step.
+        """Issue expert prefetches based on saved router logits.
 
-        Called at the **end** of each decode step, so it races ahead
-        of the *next* decode step's expert loads.
-
-        Parameters
-        ----------
-        context_ids : list[int]
-            Full token-id context so far (used for N-Gram drafting).
-        transfer_stream : torch.cuda.Stream, optional
-            CUDA stream on which to issue H2D copies.  ``None`` → skip.
-        token_hash : int, optional
-            If provided, used as a fast lookup key into the expert
-            history cache (avoids per-step N-Gram search).
+        Called at the **end** of each decode step.  Uses router probs
+        recorded by each layer during the forward pass to predict and
+        prefetch experts for the next step.
         """
-        if transfer_stream is None or self._expert_cache is None:
+        if self._expert_cache is None:
             return
 
-        predicted = self._predict_needed_experts(context_ids, token_hash)
-        if not predicted:
-            return
+        prefetch_stream = transfer_stream or self._prefetch_stream
+        layers = self._decoder_layers
 
-        # Deduplicate against recently prefetched experts
-        # (the cache's ``prefetch_expert()`` already skips VRAM-resident
-        #  experts, but we also avoid flooding the thread pool.)
-        for layer_idx, expert_idx in predicted[:self._prefetch_layers]:
-            self._prefetch_with_timeout(layer_idx, expert_idx, transfer_stream)
+        for layer_idx in range(self._num_layers - 1):
+            ly = layers[layer_idx]
+            router_probs = getattr(ly, '_last_router_probs', None)
+            if router_probs is None:
+                continue
 
-    # ------------------------------------------------------------------
-    # Prediction heuristics
-    # ------------------------------------------------------------------
+            # Get top-k expert indices from router probs
+            topk_count = min(self.NUM_HOT_EXPERTS, router_probs.size(-1))
+            _, topk_indices = torch.topk(router_probs, topk_count, dim=-1)
 
-    def _predict_needed_experts(
-        self,
-        context_ids: list[int],
-        token_hash: int | None = None,
-    ) -> list[tuple[int, int]]:
-        """Return list of (layer_idx, expert_idx) predicted to be needed
-        on upcoming decode steps.
-
-        Strategy (in order):
-        1. Token-based history lookup — if *token_hash* (or the last
-           token) has a record, return the top experts from history.
-        2. N-Gram draft fallback — predict the next token via the
-           existing N-Gram cache and look up that token's history.
-        3. SERE fallback — use the attached SERE's top_k / skip
-           threshold to compute the most-likely-to-survive experts.
-        4. Empty — no prediction possible this step.
-        """
-        # --- Strategy 1: token history ---
-        target_token = context_ids[-1] if context_ids else None
-        if target_token is not None and target_token in self._token_expert_history:
-            history = self._token_expert_history[target_token]
-            if history:
-                return history
-
-        # --- Strategy 2: N-Gram draft prediction ---
-        if self._ngram is not None and context_ids:
-            drafts = self._ngram.generate_draft(context_ids, draft_length=1)
-            if drafts:
-                draft_tok = drafts[0]
-                if draft_tok in self._token_expert_history:
-                    return self._token_expert_history[draft_tok]
-
-        # --- Strategy 3: SERE-guided fallback ---
-        if self._sere is not None:
-            k = self._sere.top_k
-            # Default: prefetch the first k experts for the first layer
-            # (the most common pattern in sequential decode)
-            fallback: list[tuple[int, int]] = []
-            _actual_experts = min(k, self._num_experts)
-            for ly in range(self._prefetch_layers):
-                fallback.extend((ly, ex) for ex in range(_actual_experts))
-            return fallback
-
-        # --- Strategy 4: conservative guess ---
-        return [(0, 0)]
-
-    # ------------------------------------------------------------------
-    # Prefetch with timeout
-    # ------------------------------------------------------------------
-
-    def _prefetch_with_timeout(
-        self,
-        layer_idx: int,
-        expert_idx: int,
-        transfer_stream: torch.cuda.Stream,
-    ) -> bool:
-        """Submit an async H2D prefetch with a 5 ms deadline.
-
-        Returns
-        -------
-        bool
-            ``True`` if the prefetch completed within the timeout,
-            ``False`` if it timed out (result dropped, no effect).
-        """
-        start = time.perf_counter()
-
-        future = self._executor.submit(
-            self._expert_cache.prefetch_expert,
-            layer_idx,
-            expert_idx,
-            transfer_stream,
-        )
-
-        try:
-            future.result(timeout=self.PREFETCH_TIMEOUT_S)
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            logger.debug(
-                "Prefetch L%d.E%d: %.2f ms (OK)",
-                layer_idx,
-                expert_idx,
-                elapsed_ms,
-            )
-            return True
-        except _TimeoutError:
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            logger.debug(
-                "Prefetch L%d.E%d: TIMEOUT (%.2f ms > %d ms limit) — dropped",
-                layer_idx,
-                expert_idx,
-                elapsed_ms,
-                self.PREFETCH_TIMEOUT_S * 1000,
-            )
-            return False
-
-    # ------------------------------------------------------------------
-    # Cleanup
-    # ------------------------------------------------------------------
+            # Prefetch for the NEXT layer (layer_idx + 1)
+            for expert_idx in topk_indices[0, 0, :].tolist():
+                self._expert_cache.prefetch_expert(
+                    layer_idx + 1,
+                    expert_idx,
+                    stream=prefetch_stream,
+                )
 
     def shutdown(self) -> None:
-        """Release the thread pool."""
-        self._executor.shutdown(wait=False)
-        logger.info("SpeculativePrefetcher: thread pool shut down.")
+        """No-op: stream cleanup handled by PyTorch."""
+        logger.info("SpeculativePrefetcher [Plan 3] shut down.")
 
     def __del__(self) -> None:
-        self.shutdown()
+        pass

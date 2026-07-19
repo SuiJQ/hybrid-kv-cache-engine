@@ -128,6 +128,19 @@ class HybridCache:
             logger.warning("torch.cuda unavailable; using default total_blocks=10000")
             return 10_000
 
+    def compute_hash(self, token_ids: list[int]) -> str:
+        """Compute the cumulative radix hash for a token sequence.
+
+        Used by AFCE to look up the corresponding AnchorSidecar.
+        This is a public alias for the internal hash chain logic.
+        """
+        if not token_ids:
+            return ""
+        h = self._hash_single_token(token_ids[0])
+        for t in token_ids[1:]:
+            h = self._incremental_hash(h, t)
+        return h
+
     def get_gpu_memory_slot(self, block_id: int) -> int:
         return block_id * self._slot_bytes
 
@@ -151,11 +164,26 @@ class HybridCache:
     # Allocation
     # ------------------------------------------------------------------
 
+    def _free_block_forced(self, block_id: int) -> None:
+        """Force-free a block without ref_count check (FIFO eviction path)."""
+        radix = self.radix_index
+        block = self.allocated_blocks.pop(block_id, None)
+        if block is None:
+            return
+        self.free_block_queue.append(block_id)
+        self._block_kv_cache.pop(block_id, None)
+        stale = [h for h, bids in radix.items() if block_id in bids]
+        for h in stale:
+            radix[h].discard(block_id)
+            if not radix[h]:
+                del radix[h]
+
     def allocate(self, prompt_tokens: list[int]) -> Block:
         """
         Allocate a new block for the given prompt tokens.
 
-        [Bug 2] Uses set[int] in radix_index so shared prefixes don't collide.
+        [FIFO Eviction] When free pool is exhausted, batch-evict the oldest
+        10%% of allocated blocks (by allocation order) without ref_count check.
         """
         if not prompt_tokens:
             raise ValueError("allocate() requires at least one token")
@@ -166,7 +194,14 @@ class HybridCache:
         tree = self._hash_tree
 
         if not free:
-            raise RuntimeError("No free blocks available in HybridCache")
+            n_evict = max(1, int(self.total_blocks * 0.10))
+            evicted = 0
+            for bid in list(blocks.keys())[:n_evict]:
+                self._free_block_forced(bid)
+                evicted += 1
+            logger.debug("FIFO eviction: evicted %d oldest blocks", evicted)
+            if not free:
+                raise RuntimeError("No free blocks available after FIFO eviction")
 
         block_id = free.pop()
 
@@ -214,10 +249,15 @@ class HybridCache:
         match_lru = self._match_cache_lru
 
         # [Bug 9] Use tuple of first 8 tokens directly as cache key.
-        cache_key = tuple(prompt_tokens[:8])
+        # Use tuple of (first 8 tokens, total length) as cache key so that
+        # different prompts with the same first 8 tokens don't collide.
+        cache_key = (tuple(prompt_tokens[:8]), len(prompt_tokens))
         if cache_key in match_cache:
             block_id, matched_len = match_cache[cache_key]
-            match_lru.remove(cache_key)
+            try:
+                match_lru.remove(cache_key)
+            except ValueError:
+                pass
             match_lru.append(cache_key)
             if block_id is not None:
                 block = blocks.get(block_id)
@@ -227,7 +267,10 @@ class HybridCache:
                     # Stale cache entry — block was freed; invalidate and fall
                     # through to the fresh lookup path below.
                     match_cache.pop(cache_key, None)
-                    match_lru.remove(cache_key)
+                    try:
+                        match_lru.remove(cache_key)
+                    except ValueError:
+                        pass
                 else:
                     if matched_len == len(prompt_tokens):
                         self._try_prefetch_children(block)
@@ -301,9 +344,8 @@ class HybridCache:
             radix = self.radix_index
             allocated = self.allocated_blocks
 
-            total_prefetch = len(children) * self._slot_bytes
-            free_mem, _ = torch.cuda.mem_get_info()
-            if free_mem < total_prefetch * 2:
+            # Static check: enough free blocks instead of dynamic cudaMemGetInfo
+            if len(self.free_block_queue) < len(children):
                 return
 
             if self._prefetch_stream is None:

@@ -4,6 +4,12 @@ FlashAttentionKernel — optimized scaled dot-product attention via torch.compil
 Uses PyTorch's native SDPA with ``torch.compile`` graph capture and
 GQA support.  Falls back gracefully when ``enable_gqa`` is not
 available on older PyTorch builds.
+
+Goose Phase 2: Added ``attn_mask`` parameter for tree attention masks.
+When ``attn_mask`` is provided, ``is_causal`` is set to ``False`` and
+the mask is passed to SDPA.  When ``None``, behavior is identical to
+the pre-Goose path — no recompilation is triggered because the
+compiled graph handles both paths with ``dynamic=True``.
 """
 
 import logging
@@ -28,6 +34,7 @@ class FlashAttentionKernel:
         v: torch.Tensor,
         softmax_scale: float,
         causal: bool = True,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute flash attention with optional causal masking and GQA.
 
@@ -43,19 +50,25 @@ class FlashAttentionKernel:
             Scale factor applied before softmax (typically ``1 / sqrt(D)``).
         causal : bool, optional
             Whether to apply causal masking (default ``True``).
+            Ignored when ``attn_mask`` is provided.
+        attn_mask : torch.Tensor | None, optional
+            Custom attention mask.  When provided, ``is_causal`` is set
+            to ``False``, and the mask itself determines which positions
+            attend to each other.  Enables tree attention masks for
+            speculative decoding (Goose Phase 2).
 
         Returns
         -------
         torch.Tensor
             Attention output tensor, shape ``(B, H_q, T, D)``.
         """
+        use_causal = causal and attn_mask is None
         try:
             return torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
+                q, k, v,
                 scale=softmax_scale,
-                is_causal=causal,
+                is_causal=use_causal,
+                attn_mask=attn_mask,
                 enable_gqa=True,
             )
         except (RuntimeError, ValueError) as _exc:
@@ -66,9 +79,8 @@ class FlashAttentionKernel:
                 _exc,
             )
             return torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
+                q, k, v,
                 scale=softmax_scale,
-                is_causal=causal,
+                is_causal=use_causal,
+                attn_mask=attn_mask,
             )

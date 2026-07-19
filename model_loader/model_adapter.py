@@ -127,14 +127,28 @@ class QuantizedKVCache:
 class MoEFlashAttention:
     @staticmethod
     @torch.compile(mode="reduce-overhead", fullgraph=False, dynamic=True)
-    def forward(q, k, v, softmax_scale, causal=True):
+    def forward(q, k, v, softmax_scale, causal=True, attn_mask=None):
+        """Flash attention with optional custom attention mask.
+
+        When ``attn_mask`` is provided, ``is_causal`` is set to ``False``
+        and the mask is passed directly to SDPA.  When ``attn_mask`` is
+        ``None`` (default), behavior is identical to pre-Goose code
+        (using ``is_causal``) — no recompilation is triggered because
+        the graph handles both paths with ``dynamic=True``.
+        """
+        use_causal = causal and attn_mask is None
         try:
             return torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, scale=softmax_scale, is_causal=causal, enable_gqa=True
+                q, k, v, scale=softmax_scale,
+                is_causal=use_causal,
+                attn_mask=attn_mask,
+                enable_gqa=True,
             )
         except (RuntimeError, ValueError):
             return torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, scale=softmax_scale, is_causal=causal
+                q, k, v, scale=softmax_scale,
+                is_causal=use_causal,
+                attn_mask=attn_mask,
             )
 
 
@@ -171,6 +185,8 @@ class MoEDecoderLayer(nn.Module):
         # [Bug 3] Seed attributes for scheduler wiring.
         self.expert_cache = None
         self.sere = None
+        self._last_router_probs = None
+        self._prefetch_stream = None
 
         prefix = f"blk.{layer_idx}"
 
@@ -247,7 +263,7 @@ class MoEDecoderLayer(nn.Module):
     def _rms_norm(x, weight, eps=1e-6):
         return x * weight / torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
 
-    def forward(self, x, past_kv=None, use_cache=False):
+    def forward(self, x, past_kv=None, use_cache=False, attention_mask=None):
         residual = x
         normed = self._rms_norm(x, self.input_norm, self.rms_norm_eps)
 
@@ -262,7 +278,7 @@ class MoEDecoderLayer(nn.Module):
             v = torch.cat([v_old.to(v.device), v], dim=2)
 
         softmax_scale = self.head_dim**-0.5
-        attn_out = MoEFlashAttention.forward(q, k, v, softmax_scale, causal=True)
+        attn_out = MoEFlashAttention.forward(q, k, v, softmax_scale, causal=True, attn_mask=attention_mask)
         attn_out = attn_out.transpose(1, 2).contiguous().view(b, t, d)
         attn_out = self.attn_o(attn_out)
         h = residual + attn_out
@@ -271,6 +287,13 @@ class MoEDecoderLayer(nn.Module):
         normed_h = self._rms_norm(h, self.post_attn_norm, self.rms_norm_eps)
         router_logits = self.router(normed_h)
         router_probs = torch.softmax(router_logits.float(), dim=-1).to(normed_h.dtype)
+
+        # Save router probs for expert prefetch (next layer)
+        self._last_router_probs = router_probs
+
+        # [Plan 3] Synchronize prefetch stream before MoE computation
+        if self.expert_cache is not None and self._prefetch_stream is not None:
+            torch.cuda.current_stream().wait_stream(self._prefetch_stream)
 
         expert_cache = self.expert_cache
         sere = self.sere
@@ -411,7 +434,7 @@ class DenseDecoderLayer(nn.Module):
     def _rms_norm(x, weight, eps=1e-6):
         return x * weight / torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
 
-    def forward(self, x, past_kv=None, use_cache=False):
+    def forward(self, x, past_kv=None, use_cache=False, attention_mask=None):
         residual = x
         normed = self._rms_norm(x, self.input_norm, self.rms_norm_eps)
         b, t, d = normed.shape
@@ -423,7 +446,7 @@ class DenseDecoderLayer(nn.Module):
             k = torch.cat([k_old.to(k.device), k], dim=2)
             v = torch.cat([v_old.to(v.device), v], dim=2)
         softmax_scale = self.head_dim**-0.5
-        attn_out = MoEFlashAttention.forward(q, k, v, softmax_scale, causal=True)
+        attn_out = MoEFlashAttention.forward(q, k, v, softmax_scale, causal=True, attn_mask=attention_mask)
         attn_out = attn_out.transpose(1, 2).contiguous().view(b, t, d)
         attn_out = self.attn_o(attn_out)
         h = residual + attn_out
@@ -629,7 +652,10 @@ class GGUFModelAdapter(nn.Module):
         new_kvs = []
         for i, layer in enumerate(self.layers):
             pkv = past_key_values[i] if past_key_values is not None else None
-            h, nkv = layer(h, past_kv=pkv, use_cache=use_cache)
+            # [Goose] Pass attention_mask for tree attention support.
+            # When attention_mask is not None, the tree mask is applied
+            # via SDPA's attn_mask parameter.
+            h, nkv = layer(h, past_kv=pkv, use_cache=use_cache, attention_mask=attention_mask)
             new_kvs.append(nkv)
 
         if self.norm_weight is not None:

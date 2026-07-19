@@ -21,6 +21,7 @@ import contextlib
 import logging
 import signal
 import sys
+import time
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -66,6 +67,10 @@ try:
 except ImportError as exc:
     logger.error("Failed to import engine modules: %s", exc)
     sys.exit(1)
+
+# [Goose] Check availability of the speculative decoding module
+import importlib.util
+_MAIN_GOOSE_OK = importlib.util.find_spec('goose_core') is not None
 
 _HAS_GGUF = False
 try:
@@ -115,13 +120,16 @@ def _inject_attention_kernel(layer: torch.nn.Module) -> None:
             k = torch.cat([past_key_value[0], k], dim=2)
             v = torch.cat([past_key_value[1], v], dim=2)
 
+        # [Goose] Custom attention mask (tree attention for Phase 2).
+        # When ``attention_mask`` is a float mask (not None), pass it to
+        # the flash attention kernel instead of using ``is_causal``.
+        # Standard HF padding mask is typically None for batch-1 decode.
         softmax_scale = head_dim**-0.5
         attn_output = FlashAttentionKernel.forward(
-            q,
-            k,
-            v,
+            q, k, v,
             softmax_scale=softmax_scale,
-            causal=True,
+            causal=(attention_mask is None),
+            attn_mask=attention_mask,
         )
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(batch_size, seq_len, -1)
@@ -242,8 +250,145 @@ def load_and_inject_gguf_model(
     return model
 
 
+# ===================================================================
+# Benchmark runner
+# ===================================================================
+
+# A synthetic fixed token pattern.  Using small token IDs works with any
+# model (they embed to some vector) and ensures a repeatable, fixed-length
+# input for fair measurement.
+_SYNTHETIC_SEED: list[int] = [42, 17, 88, 33, 55, 99, 21, 73, 61, 8]
+
+
+def _make_synthetic_prompt(length: int) -> list[int]:
+    """Build a prompt of exactly *length* tokens by repeating a seed."""
+    tokens: list[int] = []
+    while len(tokens) < length:
+        tokens.extend(_SYNTHETIC_SEED[: length - len(tokens)])
+    if len(tokens) < 1:
+        tokens = [42]
+    return tokens
+
+
+async def run_benchmark(
+    scheduler: "UnifiedScheduler",
+    prompt_len: int = 128,
+    gen_len: int = 128,
+) -> dict:
+    """Run a single-request benchmark and return timing measurements.
+
+    Steps
+    -----
+    1. Warmup: prompt_len=32, gen_len=32 -> discarded.
+    2. Measure: prompt_len=prompt_len, gen_len=gen_len.
+    3. Print a formatted report.
+    """
+    prompt = _make_synthetic_prompt(prompt_len)
+    request_id_fmt = "bench_{}"
+
+    def _submit_and_wait(plen: int, glen: int, rid: str) -> dict:
+        req = Request(
+            prompt_tokens=prompt[:plen],
+            request_id=rid,
+            max_new_tokens=glen,
+        )
+        scheduler.submit(req)
+
+        start_wall = time.monotonic()
+        first_token_time = None
+
+        while True:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.run_until_complete(scheduler.step())
+            except RuntimeError:
+                loop2 = asyncio.new_event_loop()
+                loop2.run_until_complete(scheduler.step())
+                loop2.close()
+
+            found = None
+            for dr in scheduler.active_decode_pool:
+                if dr.request_id == rid:
+                    found = dr
+                    break
+
+            if found is None:
+                time.sleep(0.001)
+                continue
+
+            if first_token_time is None:
+                first_token_time = time.monotonic()
+
+            if found.is_done:
+                total_time = time.monotonic() - start_wall
+                gen_tokens = len(found.generated_tokens)
+                ttft = first_token_time - start_wall
+                return {
+                    "ttft_s": ttft,
+                    "e2e_s": total_time,
+                    "gen_tokens": gen_tokens,
+                    "throughput_tok_s": gen_tokens / total_time if total_time > 0 else 0.0,
+                    "decode_steps": found._step_count,  # noqa: SLF001
+                    "spec_enabled": scheduler._goose_enabled,
+                }
+
+            time.sleep(0.001)
+
+    # ---- Warmup (discarded) ----
+    _orig_level = logging.getLogger().getEffectiveLevel()
+    logging.getLogger().setLevel(logging.WARNING)
+    logger.info("Benchmark warmup: 32 -> 32 tokens...")
+    _submit_and_wait(32, 32, request_id_fmt.format("warmup"))
+    logging.getLogger().setLevel(_orig_level)
+
+    # ---- Let speculation engine populate transition table ----
+    if scheduler._goose_enabled:
+        for _ in range(5):
+            try:
+                loop = asyncio.get_running_loop()
+                loop.run_until_complete(scheduler.step())
+            except RuntimeError:
+                loop2 = asyncio.new_event_loop()
+                loop2.run_until_complete(scheduler.step())
+                loop2.close()
+
+    # ---- Measure ----
+    logger.info(
+        "Benchmark: %d -> %d tokens (spec=%s)...",
+        prompt_len, gen_len, scheduler._goose_enabled,
+    )
+    result = _submit_and_wait(prompt_len, gen_len, request_id_fmt.format("measure"))
+
+    # ---- Print report ----
+    sep = "=" * 56
+    spec_label = "Goose" if scheduler._goose_enabled else "None"
+    ms_per_tok = result["e2e_s"] * 1000 / max(result["gen_tokens"], 1)
+
+    print(f"\n{sep}")
+    print("  MoeOwner Benchmark Report")
+    print(sep)
+    print(f"  Prompt length:       {prompt_len:>6d} tokens")
+    print(f"  Generation length:   {gen_len:>6d} tokens")
+    print(f"  Speculation:         {spec_label:>10s}")
+    print(sep)
+    print(f"  Time to first token: {result['ttft_s']*1000:>8.1f} ms")
+    print(f"  End-to-end time:     {result['e2e_s']:>8.3f} s")
+    print(f"  Generated tokens:    {result['gen_tokens']:>6d}")
+    print(f"  Decode steps:        {result['decode_steps']:>6d}")
+    print(f"  Throughput:          {result['throughput_tok_s']:>8.1f} tok/s")
+    print(f"  Per-token latency:   {ms_per_tok:>8.2f} ms/tok")
+    if scheduler._goose_enabled and scheduler._goose_engine is not None:
+        eng = scheduler._goose_engine
+        print(f"  Spine ratio (EMA):   {eng._spine_ratio:>8.2f}")  # noqa: SLF001
+        print(f"  PLD acceptance EMA:  {eng._pld_acceptance_ema:>8.2f}")  # noqa: SLF001
+    print(sep)
+    print()
+
+    return result
+
+
 # ---------------------------------------------------------------------------
-# Stage 5: Main async loop with HTTP API
+# Stage 5: Main async loop with HTTP API / Benchmark
 # ---------------------------------------------------------------------------
 
 
@@ -299,6 +444,28 @@ async def main() -> None:
         action="store_true",
         help="Enable debug-level logging",
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run built-in benchmark instead of engine loop",
+    )
+    parser.add_argument(
+        "--benchmark-prompt-len",
+        type=int,
+        default=128,
+        help="Fixed prompt token length for benchmark (default: 128)",
+    )
+    parser.add_argument(
+        "--benchmark-gen-len",
+        type=int,
+        default=128,
+        help="Fixed generation token length for benchmark (default: 128)",
+    )
+    parser.add_argument(
+        "--speculative",
+        action="store_true",
+        help="Enable Goose speculative decoding (for benchmark or API mode)",
+    )
     args = parser.parse_args()
 
     if args.verbose:
@@ -332,6 +499,14 @@ async def main() -> None:
         detokenizer=tokenizer.decode if tokenizer is not None else None,
     )
 
+    # [Goose] Initialize speculative decoding if requested
+    if args.speculative:
+        if _MAIN_GOOSE_OK:
+            scheduler._init_goose(tree_enabled=False, max_draft=5)
+            logger.info("Goose speculative decoding enabled (Phase 0/1 — linear chain)")
+        else:
+            logger.warning("--speculative requested but goose_core not available; ignoring.")
+
     # ---- Signal handling ----
     def _signal_handler(signum, frame):
         logger.info("Received signal %d, shutting down gracefully...", signum)
@@ -355,6 +530,17 @@ async def main() -> None:
         )
     else:
         logger.info("API server disabled (--api-port=0). Running engine loop only.")
+
+    # ---- Route: Benchmark or Engine loop ----
+    if args.benchmark:
+        await run_benchmark(
+            scheduler,
+            prompt_len=args.benchmark_prompt_len,
+            gen_len=args.benchmark_gen_len,
+        )
+        scheduler.shutdown()
+        logger.info("Benchmark complete.")
+        return
 
     # ---- Engine loop (drives scheduler periodically) ----
     logger.info("Engine running.")
