@@ -44,6 +44,7 @@ BANNER = f"""
     ║                                           ║
     ║     MoeOwner 推理引擎                      ║
     ║     Hybrid KV Cache + Goose 推测解码       ║
+    ║     + 超长上下文 (SelfExtend 默认开启)     ║
     ║                                           ║
     ╚═══════════════════════════════════════════╝
 {Style.RESET}
@@ -56,6 +57,8 @@ MENU = f"""
   {Style.GREEN}[3]{Style.RESET}  直接启动服务（跳过测试）
   {Style.GREEN}[4]{Style.RESET}  查看系统状态
   {Style.GREEN}[q]{Style.RESET}  退出
+
+{Style.DIM}  💡 超长上下文 (SelfExtend) 默认自动开启，无需任何参数{Style.RESET}
 """
 
 
@@ -148,6 +151,36 @@ def ask_model(args: list[str]) -> tuple[str, str]:
     return path, "gguf" if path.endswith(".gguf") else "hf"
 
 
+# ── 超长上下文方法解析 ────────────────────────────────────────────
+
+LONG_CONTEXT_METHODS = ["none", "selfextend", "reattention", "yarn"]
+
+def parse_context_method(raw_args: list[str]) -> str:
+    """Extract --context-method value from raw CLI args if present."""
+    for i, a in enumerate(raw_args):
+        if a == "--context-method" and i + 1 < len(raw_args):
+            val = raw_args[i + 1]
+            if val in LONG_CONTEXT_METHODS:
+                return val
+        if a == "--disable-long-context":
+            return "none"
+    env_val = os.environ.get("CONTEXT_METHOD", "")
+    return env_val if env_val in LONG_CONTEXT_METHODS else "selfextend"
+
+
+def ask_context_method() -> str:
+    """交互式选择超长上下文方法。"""
+    print(f"\n{Style.BOLD}超长上下文扩展方法{Style.RESET}")
+    print(f"{Style.DIM}  默认: selfextend (4行代码，通吃RoPE模型，已开启)")
+    print(f"  • selfextend  — 4行代码，通吃RoPE模型 (LLaMA/Qwen/Mistral)")
+    print(f"  • reattention — 任意Transformer均可用，两步注意力")
+    print(f"  • yarn        — 行业标准，HF Transformers内置")
+    print(f"  • none        — 关闭{Style.RESET}")
+    choices_text = "/".join(f"{c}" for c in LONG_CONTEXT_METHODS)
+    method = input(f"{Style.CYAN}选择 [{choices_text}，直接回车默认 selfextend]: {Style.RESET}").strip().lower()
+    return method if method in LONG_CONTEXT_METHODS else "selfextend"
+
+
 # ── 功能函数 ────────────────────────────────────────────────────────
 
 def run_command(cmd: list[str], desc: str = "") -> int:
@@ -162,7 +195,8 @@ def run_command(cmd: list[str], desc: str = "") -> int:
 
 
 def run_benchmark(model_path: str, mtype: str, prompt_len: int = 128,
-                  gen_len: int = 128, use_spec: bool = False) -> int:
+                  gen_len: int = 128, use_spec: bool = False,
+                  context_method: str = "none") -> int:
     """运行基准测试。"""
     if not os.path.exists(os.path.join(os.path.dirname(__file__) or ".", "main.py")):
         print(f"{Style.RED}错误: 找不到 main.py{Style.RESET}")
@@ -177,11 +211,14 @@ def run_benchmark(model_path: str, mtype: str, prompt_len: int = 128,
         cmd += ["--model", model_path]
     if use_spec:
         cmd += ["--speculative"]
+    if context_method and context_method != "none":
+        cmd += ["--context-method", context_method]
 
     print(f"\n{Style.BOLD}{Style.MAGENTA}基准测试：{Style.RESET}")
     print(f"{Style.DIM}  • 预热: 32 → 32 tokens")
     print(f"  • 测试: {prompt_len} → {gen_len} tokens")
     print(f"  • 推测: {'已启用 (Goose)' if use_spec else '未启用'}")
+    print(f"  • 超长上下文: {context_method if context_method != 'none' else '未启用'}")
     print(f"  • 模型: {os.path.basename(model_path) if mtype == 'gguf' else model_path}{Style.RESET}")
     print(f"{Style.DIM}  (测试中，请耐心等待...){Style.RESET}\n")
     sys.stdout.flush()
@@ -189,7 +226,8 @@ def run_benchmark(model_path: str, mtype: str, prompt_len: int = 128,
 
 
 def run_interactive(model_path: str, mtype: str, api_port: int = 8000,
-                    use_spec: bool = False):
+                    use_spec: bool = False,
+                    context_method: str = "none"):
     """启动 API 服务器（交互模式）。"""
     cmd = [sys.executable, "-u", "main.py",
            "--api-port", str(api_port)]
@@ -199,12 +237,21 @@ def run_interactive(model_path: str, mtype: str, api_port: int = 8000,
         cmd += ["--model", model_path]
     if use_spec:
         cmd += ["--speculative"]
+    if context_method and context_method != "none":
+        cmd += ["--context-method", context_method]
+        if context_method == "selfextend":
+            cmd += ["--neighbor-window", "1024", "--group-size", "8"]
+        elif context_method == "reattention":
+            cmd += ["--reattn-top-k", "2048"]
+        elif context_method == "yarn":
+            cmd += ["--yarn-factor", "8"]
 
     print(f"\n{Style.GREEN}{Style.BOLD}启动服务...{Style.RESET}")
     print(f"{Style.DIM}  • API: http://localhost:{api_port}/v1/completions")
     print(f"  • 健康检查: http://localhost:{api_port}/health")
     print(f"  • 模型: {os.path.basename(model_path) if mtype == 'gguf' else model_path}")
     print(f"  • 推测: {'已启用' if use_spec else '未启用'}")
+    print(f"  • 超长上下文: {context_method if context_method != 'none' else '未启用'}")
     print(f"{Style.DIM}  • 按 Ctrl+C 停止服务{Style.RESET}\n")
     sys.stdout.flush()
 
@@ -282,12 +329,14 @@ def main():
     if auto_mode or quick_mode or not sys.stdout.isatty():
         model_path, mtype = ask_model(args)
         use_spec = "--speculative" in args or "-s" in args
+        context_method = parse_context_method(args)
 
         if not quick_mode:
             rc = run_benchmark(model_path, mtype,
                                prompt_len=int(os.environ.get("BENCH_PROMPT_LEN", "128")),
                                gen_len=int(os.environ.get("BENCH_GEN_LEN", "128")),
-                               use_spec=use_spec)
+                               use_spec=use_spec,
+                               context_method=context_method)
             if rc != 0:
                 print(f"{Style.RED}测试失败 (exit={rc})。是否继续启动？{Style.RESET}")
                 try:
@@ -298,7 +347,8 @@ def main():
                     sys.exit(rc)
 
         port = int(os.environ.get("API_PORT", "8000"))
-        run_interactive(model_path, mtype, api_port=port, use_spec=use_spec)
+        run_interactive(model_path, mtype, api_port=port, use_spec=use_spec,
+                        context_method=context_method)
         return
 
     # ── 交互式菜单 ────────────────────────────────────────────────
@@ -326,26 +376,33 @@ def main():
 
             use_spec_input = input(f"{Style.CYAN}启用 Goose 推测解码？(y/N): {Style.RESET}").strip().lower()
             use_spec = use_spec_input == "y"
+            print(f"\n  {Style.DIM}💡 超长上下文扩展默认已开启 (SelfExtend)")
+            print(f"  如需切换，启动后用 --context-method 指定{Style.RESET}")
+            context_method = "selfextend"  # 默认开启，不再询问
 
             if choice == "2":
                 # 仅基准测试
-                run_benchmark(model_path, mtype, use_spec=use_spec)
+                run_benchmark(model_path, mtype, use_spec=use_spec,
+                              context_method=context_method)
                 input(f"\n{Style.DIM}按 Enter 继续...{Style.RESET}")
 
             elif choice == "1":
                 # 完整流程：先测试，再启动
-                rc = run_benchmark(model_path, mtype, use_spec=use_spec)
+                rc = run_benchmark(model_path, mtype, use_spec=use_spec,
+                                    context_method=context_method)
                 if rc != 0:
                     print(f"{Style.RED}测试失败。仍要启动服务吗？{Style.RESET}")
                     cont = input("[y/N]: ").strip().lower()
                     if cont != "y":
                         continue
-                run_interactive(model_path, mtype, use_spec=use_spec)
+                run_interactive(model_path, mtype, use_spec=use_spec,
+                                context_method=context_method)
                 break  # 服务结束后退出
 
             elif choice == "3":
                 # 直接启动
-                run_interactive(model_path, mtype, use_spec=use_spec)
+                run_interactive(model_path, mtype, use_spec=use_spec,
+                                context_method=context_method)
                 break
         else:
             print(f"{Style.RED}无效选项，请重新输入{Style.RESET}")

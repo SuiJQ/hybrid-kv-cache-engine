@@ -2,7 +2,7 @@
 
 > **MoE 异构推理引擎** — 融合 PagedAttention + RadixAttention KV Cache、专家缓存、SERE 推测跳过与 N-Gram 推测解码
 >
-> _🏷️ MoE · LLM Inference · KV Cache · Speculative Decoding · Expert Offloading · GGUF · Pure Python · CUDA · Flash Attention_
+> _🏷️ MoE · LLM Inference · KV Cache · Speculative Decoding · Expert Offloading · GGUF · Pure Python · CUDA · Flash Attention · Long Context_
 
 ---
 
@@ -28,21 +28,46 @@
 | 🚀 **入口** | `main.py` | 全局配置、模型注入、事件循环 |
 | 📖 **GGUF 加载** | `model_loader/` | 纯 Python GGUF v3 解析器 + PyTorch 原生量化适配 |
 | 🧠 **专家缓存** | `expert_cache.py` | 层次化 LRU-Frequency-Reuse 专家权重卸载/加载 |
+| 🧩 **超长上下文** | `long_context/` | SelfExtend / ReAttention / YaRN 训练无关上下文扩展（默认开启） |
 | ⚡ **SERE** | `sere.py` | 动态专家跳过，top-k 后重路由 |
 | 🔮 **推测解码** | `ngram_speculation.py` | CPU Trie N-Gram 推测解码 |
 
-> **关键词**：MoE推理 | 大模型加速 | 混合KV缓存 | 专家卸载 | FlashAttention | 推测解码 | 双流管线 | PyTorch | GGUF | 纯Python
+> **关键词**：MoE推理 | 大模型加速 | 混合KV缓存 | 专家卸载 | FlashAttention | 推测解码 | 超长上下文 | 双流管线 | PyTorch | GGUF | 纯Python
+
+---
+
+## 🎯 零手动调优 — 插电即用
+
+**MoeOwner 的所有优化手段全部自动开启，零参数、零配置、零手动调优。** 用户只需 `python main.py --model <某个模型>`，其余全部自动完成：
+
+| 优化项 | 自动生效方式 | 用户操作 |
+|--------|-------------|----------|
+| 🔥 **FlashAttention SDPA** | 强制启用 flash 版，禁用 math/mem_efficient 回退 | `main.py` 启动即开 ✅ |
+| ⚡ **cuDNN benchmark** | `torch.backends.cudnn.benchmark = True` | 自动 ✅ |
+| 🚀 **TF32 矩阵乘** | matmul + cuDNN 双路允许 TF32（Ampere+ 架构） | 自动 ✅ |
+| 🎯 **Float32 matmul precision** | `torch.set_float32_matmul_precision("high")` | 自动 ✅ |
+| 📦 **torch.compile 静态图编译** | 自动尝试 reduce-overhead → default 降级链，失败则跳过 | 自动 ✅ |
+| 🧊 **KV Cache 非对称量化** | Key→INT8 + Value→INT4，首尾 8 token 保留 FP16，门控透明 | 自动 ✅ |
+| 📏 **动态块大小建议** | 根据 hidden_size 自动最优推荐 | 自动 ✅ |
+| 🔗 **超长上下文 SelfExtend** | 默认开启（4 行位置编码逻辑，无需任何配置） | 自动 ✅ |
+| ⏱ **双 CUDA 流管线** | Prefill 流 + Decode 流自动配合 | 自动 ✅ |
+| 🔎 **Goose 推测解码** | `--speculative` 一键开启，无需手工调优 | `--speculative` |
+
+> **不需要：** 修改任何配置文件、设置任何环境变量、提供任何调优参数。
+> 也不需要在不同模型间切换不同配置——所有优化对 HF / GGUF / 任意尺寸模型一视同仁。
+
+---
 
 ### 核心技术
 
-- **增量 SHA-256 哈希链**：严格 `SHA256(SHA256(prev).digest() + token_bytes)`，非 `hashlib.update()`，保证 Radix 树可匹配任意前缀
+- **增量 BLAKE2b 哈希链**：严格 `BLAKE2b(BLAKE2b(prev).digest() + token_bytes)`，非 `hashlib.update()`，保证 Radix 树可匹配任意前缀
 - **显存感知容量计算**：`total_blocks = int(free_mem * 0.85 / (block_size * hidden_size * 4))`
 - **复合键守卫 GC**：防止哈希重用导致的误删
 - **双 CUDA 流管线**：Prefill 流 + Decode 流，主线程统一同步（防死锁）
 - **引用计数驱逐**：每个匹配的自增引用，ref_count=0 时回收至空闲队列
 - **纯 Python GGUF 解析器**：仅依赖 struct+mmap+PyTorch，无需 llama-cpp-python
 - **原生量化加载**：Q4_0/Q8_0 纯 PyTorch bitwise 反量化，零 C 扩展
-- **KV Cache 非对称量化**：Key→INT8 + **Value→INT4 位运算打包**，显存降至 FP16 的 37.5%
+- **KV Cache 非对称量化**：Key→INT8 + **Value→INT4 位运算打包**，显存降至 FP16 的 37.5%（首尾各 8 个 token 保留 FP16 精度）
 - **LRU 前缀匹配缓存**：`match_prefix` 增加 hash-based LRU（max 256 条目），重复前缀 **O(1)** 命中
 
 ---
@@ -154,15 +179,6 @@ model_loader/
 | Q4_0 | ✅ 纯 PyTorch | 位移解包 → FP16 |
 | Q8_0 | ✅ 纯 PyTorch | INT8 缩放 → FP16 |
 
-**零成本优化已内嵌**：
-
-- Flash Attention v2 SDPA — 利用 N 卡 Tensor Core（强制启用，禁用 math/mem_efficient 回退）
-- cuDNN benchmark — 运行时自动调优卷积/注意力 kernel
-- `torch.compile(dynamic=True)` — 静态图编译 + 可变长度输入不触发重编译
-- TF32 精度 — Ampere+ 架构矩阵乘提速（matmul + cuDNN 双路）
-- Float32 matmul precision='high' — 混合精度舍入控制
-- 动态 Block Size — 根据模型参数量建议最优块大小
-
 ---
 
 ## 架构设计
@@ -173,24 +189,27 @@ model_loader/
 阶段 1: 环境锁定
   └─ Python 3.12 + torch 2.6 + transformers 4.51
 
-阶段 2: 全局 Torch 配置
-  ├─ Flash SDP 强制启用
-  ├─ TF32 matmul 允许
-  └─ float32 精度 = 'high'
+阶段 2: 全局 Torch 配置（全部自动）
+  ├─ Flash SDP 强制启用（禁用 math/mem_efficient 回退）
+  ├─ TF32 matmul + cuDNN 允许
+  ├─ float32 精度 = 'high'
+  └─ cuDNN benchmark 自动调优
 
 阶段 3: 模块组装
   ├─ attention_kernel.py ──── FlashAttentionKernel (torch.compile)
-  ├─ cache_manager.py ─────── HybridCache (Paged + Radix)
+  ├─ cache_manager.py ─────── HybridCache (Paged + Radix + KV 非对称量化)
   ├─ scheduler.py ─────────── UnifiedScheduler (双流管线)
   ├─ expert_cache.py ──────── 层次化专家缓存
   ├─ sere.py ──────────────── 动态专家跳过
   ├─ ngram_speculation.py ─── N-Gram 推测解码
+  ├─ long_context/ ────────── SelfExtend / ReAttention / YaRN（默认 SelfExtend 自动开启）
   └─ model_loader/ ────────── GGUF 加载 + PyTorch 量化
 
 阶段 4: 模型注入（二选一）
   ├─ HuggingFace 路径: 加载 HF 模型 (fp16), 替换每层 self_attn → FlashAttentionKernel
+  │                          （自动注入 SelfExtend / ReAttention 到 attention 前向）
   └─ GGUF 路径: 解析 GGUF 文件, 反量化权重, 构建 GGUFModelAdapter
-  └─ 预热编译 → dummy_input 触发 JIT
+  └─ 预热编译 → dummy_input 触发 JIT 静态图编译
 
 阶段 5: 事件循环
   └─ 无限调度: step() → 预填充/解码/同步/GC
@@ -215,6 +234,36 @@ model_loader/
 │  └─────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### 超长上下文扩展 (SelfExtend)
+
+**自动开启，无需任何参数。** MoeOwner 集成了三种训练无关的上下文窗口扩展方法：
+
+| 方法 | 适用模型 | 原理 |
+|------|----------|------|
+| 🥇 **SelfExtend**（默认） | RoPE 类模型（LLaMA/Qwen/Mistral/Gemma） | 4 行位置编码逻辑，邻近 token 保持原位置，远端 token floor-division 分组 |
+| 🥈 **ReAttention** | 任意 Transformer（不依赖 RoPE） | 内容感知 top-k 检索 + 有限注意力 |
+| 🥉 **YaRN** | HuggingFace 内置（`rope_scaling`） | 行业标准，零运行时开销 |
+
+```bash
+# SelfExtend —— 默认启用，什么都不用加
+python main.py --model Qwen/Qwen2.5-32B
+
+# 切换为 ReAttention
+python main.py --model Qwen/Qwen2.5-32B --context-method reattention
+
+# 使用 YaRN
+python main.py --model Qwen/Qwen2.5-32B --context-method yarn --yarn-factor 16
+
+# 关闭
+python main.py --model Qwen/Qwen2.5-32B --disable-long-context
+```
+
+> 上下文短于 2048 tokens 时自动跳过（`short_context_threshold`），不影响短文本性能。
+
+集成在 `long_context/` 模块中，与所有其他优化（KV cache 量化、Goose、AFCE、OEF、SERE）完全兼容。
+
+---
 
 ### 双流管线
 
@@ -241,7 +290,7 @@ model_loader/
 python3 -m pytest tests/ -v
 ```
 
-当前通过 **35 项**自动化测试：
+当前通过 **58 项**自动化测试：
 
 - ✅ 块分配与空闲队列管理
 - ✅ 增量哈希链一致性
@@ -253,8 +302,12 @@ python3 -m pytest tests/ -v
 - ✅ 复合键守卫防误删
 - ✅ LRU 缓存命中（O(1) 返回，ref_count 递增）
 - ✅ LRU 淘汰稳定（不超过 max）
-- ✅ KV Cache INT4 量化 round-trip（含负值验证）
+- ✅ KV Cache 非对称量化 round-trip（Key INT8 + Value INT4 packed）
 - ✅ KV Cache 形状减半正确性
+- ✅ KV 首尾 FP16 保护（PROTECTED_N=8 边界测试）
+- ✅ KV 混合模式 store/load 全链路（多 layer、覆写、释放）
+- ✅ Key INT8 per-head 缩放维度与零值测试
+- ✅ Value INT4 位运算 packed 确定性测试
 - ✅ ruff 静态审查 0 错误
 
 ---
@@ -288,35 +341,55 @@ python3 -m pytest tests/ -v
 
 # MoeOwner — _English_
 
-> **Heterogeneous MoE Inference Engine** — Integrating PagedAttention + RadixAttention KV Cache, Expert Offloading, SERE Dynamic Expert Skipping, and N-Gram Speculative Decoding.
+> **Heterogeneous MoE Inference Engine** — Integrating PagedAttention + RadixAttention KV Cache, Expert Offloading, SERE Dynamic Expert Skipping, N-Gram Speculative Decoding, and Training-Free Long Context Extension.
 >
-> _🏷️ Tags: MoE · LLM Inference · KV Cache · Speculative Decoding · Expert Offloading · GGUF · Pure Python · CUDA · Flash Attention · PyTorch_
+> _🏷️ Tags: MoE · LLM Inference · KV Cache · Speculative Decoding · Expert Offloading · GGUF · Pure Python · CUDA · Flash Attention · PyTorch · Long Context_
 
 A production-oriented inference engine purpose-built for **Mixture-of-Experts** large language models. It fuses classic KV cache management with MoE-specific optimizations in a single, cohesive pipeline.
+
+## 🎯 Zero Manual Tuning — Plug and Run
+
+**All optimizations are auto-enabled — zero config, zero parameters, zero manual tuning.** Just `python main.py --model <some_model>` and everything works:
+
+| Optimization | How It's Auto-Enabled | User Action |
+|-------------|----------------------|-------------|
+| 🔥 **FlashAttention SDPA** | Forces flash variant; disables math/mem_efficient fallback | Auto on `main.py` start ✅ |
+| ⚡ **cuDNN benchmark** | `torch.backends.cudnn.benchmark = True` | Automatic ✅ |
+| 🚀 **TF32 matmul** | Both matmul and cuDNN TF32 paths enabled (Ampere+) | Automatic ✅ |
+| 🎯 **Float32 matmul precision** | `torch.set_float32_matmul_precision("high")` | Automatic ✅ |
+| 📦 **torch.compile** | Auto-tries reduce-overhead → default fallback chain; gracefully skips on failure | Automatic ✅ |
+| 🧊 **KV Cache asymmetric quantization** | Key→INT8 + Value→INT4 packed; head/tail 8-token FP16 protection; transparent gate | Automatic ✅ |
+| 📏 **Dynamic block size** | Auto-recommends based on hidden_size | Automatic ✅ |
+| 🔗 **Long context SelfExtend** | Default-on (4-line position-id injection, zero config needed) | Automatic ✅ |
+| ⏱ **Dual CUDA stream pipeline** | Prefill + decode streams auto-coordinated | Automatic ✅ |
+| 🔎 **Goose speculative decoding** | One-flag enable (`--speculative`), no manual tuning needed | `--speculative` |
+
+> **No need to:** edit config files, set environment variables, provide tuning parameters, or switch settings between different models. All optimizations work uniformly for HF models, GGUF models, and any model size.
 
 ## Key Features
 
 | Module | File | Role |
 |--------|------|------|
 | 🔥 FlashAttention Kernel | `attention_kernel.py` | Optimized PyTorch SDPA + `torch.compile` attention |
-| 📦 Hybrid Cache | `cache_manager.py` | PagedAttention physical blocks + RadixAttention hash index |
+| 📦 Hybrid Cache | `cache_manager.py` | PagedAttention physical blocks + RadixAttention hash index + KV asymmetric quantization |
 | ⏱ Unified Scheduler | `scheduler.py` | Chunked Prefill + Decode dual-CUDA-stream pipeline |
 | 🚀 Entrypoint | `main.py` | Global config, model injection, event loop, HTTP API server |
 | 📖 GGUF Loader | `model_loader/` | Pure Python GGUF v3 parser — no llama-cpp-python required |
 | 🧠 Expert Cache | `expert_cache.py` | Hierarchical LFRU expert weight offloading (DRAM + VRAM) |
+| 🧩 Long Context | `long_context/` | SelfExtend / ReAttention / YaRN — training-free context window extension |
 | ⚡ SERE | `sere.py` | Dynamic expert skipping via post-routing logit redirection |
 | 🔮 N-Gram Speculation | `ngram_speculation.py` | CPU Trie-based draft generation + verification |
 
 ### Core Technologies
 
-- **Incremental SHA-256 hash chain** — `SHA256(SHA256(prev).digest() + token)` enables arbitrary prefix matching in the Radix tree
+- **Incremental BLAKE2b hash chain** — `BLAKE2b(BLAKE2b(prev).digest() + token)` enables arbitrary prefix matching in the Radix tree
 - **VRAM-aware capacity** — `total_blocks = int(free_mem * 0.85 / (block_size * hidden_size * 4))`
 - **Compound-key GC guard** — prevents accidental eviction due to hash collisions
 - **Dual CUDA streams** — prefill and decode run concurrently; main thread synchronizes at checkpoint
 - **Reference-counted eviction** — each prefix match increments ref_count; blocks recycled at 0
 - **Pure Python GGUF parser** — depends only on `struct` + `mmap` + PyTorch
 - **Native quantization** — Q4_0/Q8_0 bitwise dequantization in pure PyTorch, zero C extensions
-- **KV Cache asymmetric quantization** — Key→INT8 + Value→INT4 packed, reducing memory to 37.5% of FP16
+- **KV Cache asymmetric quantization** — Key→INT8 + Value→INT4 packed, reducing memory to 37.5% of FP16 (first/last 8 tokens preserved at FP16)
 - **LRU prefix match cache** — hash-based LRU (max 256 entries), **O(1)** for repeated prefixes
 
 ## Quick Start
@@ -329,11 +402,14 @@ pip install transformers==4.51.3
 # Run tests
 python3 -m pytest tests/ -v
 
-# Start inference engine with HuggingFace model
+# Start inference engine with HuggingFace model (SelfExtend auto-enabled)
 python main.py --model Qwen/Qwen2.5-1.5B-Instruct --api-port 8000
 
-# Or with a GGUF model
+# Or with a GGUF model (SelfExtend auto-enabled)
 python main.py --gguf /path/to/model.Q4_0.gguf --block-size 32 --verbose
+
+# Disable long context
+python main.py --model Qwen/Qwen2.5-1.5B-Instruct --disable-long-context
 ```
 
 ## Architecture Overview

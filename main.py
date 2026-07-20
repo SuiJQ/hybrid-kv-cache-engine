@@ -2,10 +2,15 @@
 """
 Pure Python Inference Engine — MoE-first Inference Server with HTTP API.
 
-Usage:
-    python main.py --model Qwen/Qwen2.5-1.5B-Instruct
-    python main.py --gguf models/Model.gguf
-    python main.py --gguf models/Model.gguf --api-port 8000
+Long context extension (auto-enabled — SelfExtend by default):
+    python main.py --model Qwen/Qwen2.5-1.5B-Instruct                                    # SelfExtend 自动开启
+    python main.py --model Qwen/Qwen2.5-1.5B-Instruct --context-method reattention        # 切换为 ReAttention
+    python main.py --gguf models/Model.gguf                                               # SelfExtend 自动开启
+    python main.py --model Qwen/Qwen2.5-32B --context-method yarn --yarn-factor 16        # 使用 YaRN
+    python main.py --model ... --disable-long-context                                     # 手动关闭
+
+The long context module adds ZERO weight changes — it's pure inference-time
+logic injected at the attention level.  Auto-enabled by default. See ``long_context/``.
 """
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -83,12 +88,43 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: Model loading & kernel injection
+# Stage 4: Model loading & kernel injection (with long context support)
 # ---------------------------------------------------------------------------
 
 
+_LONG_CONTEXT_LC_CONFIG: object = None
+
+
+def set_long_context_config(config: object) -> None:
+    """Set the global long context config used during model injection."""
+    global _LONG_CONTEXT_LC_CONFIG
+    _LONG_CONTEXT_LC_CONFIG = config
+
+
 def _inject_attention_kernel(layer: torch.nn.Module) -> None:
-    """Replace ``self_attn.forward`` with compiled flash SDPA kernel."""
+    """
+    Replace ``self_attn.forward`` with flash SDPA kernel.
+
+    If long context (SelfExtend / ReAttention) is configured, wraps the
+    kernel with the extended attention logic.  Falls back to vanilla
+    flash attention otherwise (or if YaRN is selected, which is a config-
+    level setting in HF Transformers).
+    """
+    global _LONG_CONTEXT_LC_CONFIG
+    lcc = _LONG_CONTEXT_LC_CONFIG
+
+    # ── SelfExtend / ReAttention: use the long-context-aware injector ──
+    if lcc is not None and getattr(lcc, "enabled", False) and getattr(lcc, "method", "none") in ("selfextend", "reattention"):
+        from long_context.integration import LongContextAttentionInjector  # noqa: PLC0415
+        injector = LongContextAttentionInjector(lcc)
+        attn = getattr(layer, "self_attn", None)
+        if attn is not None:
+            attn.forward = injector._make_patched_forward(attn)
+            attn.long_context_injected = True
+            attn.is_causal = True
+        return
+
+    # ── Vanilla flash attention (YaRN / none) ──
     from attention_kernel import FlashAttentionKernel  # noqa: PLC0415
 
     attn = getattr(layer, "self_attn", None)
@@ -100,6 +136,7 @@ def _inject_attention_kernel(layer: torch.nn.Module) -> None:
         attention_mask: torch.Tensor | None = None,
         past_key_value=None,
         use_cache: bool = False,
+        position_ids: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple:
         batch_size, seq_len, _ = hidden_states.shape
@@ -115,15 +152,11 @@ def _inject_attention_kernel(layer: torch.nn.Module) -> None:
         k = k.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
 
-        # Concatenate cached KV for incremental decode (O(n) attention)
+        # Concatenate cached KV for incremental decode
         if past_key_value is not None:
             k = torch.cat([past_key_value[0], k], dim=2)
             v = torch.cat([past_key_value[1], v], dim=2)
 
-        # [Goose] Custom attention mask (tree attention for Phase 2).
-        # When ``attention_mask`` is a float mask (not None), pass it to
-        # the flash attention kernel instead of using ``is_causal``.
-        # Standard HF padding mask is typically None for batch-1 decode.
         softmax_scale = head_dim**-0.5
         attn_output = FlashAttentionKernel.forward(
             q, k, v,
@@ -136,7 +169,6 @@ def _inject_attention_kernel(layer: torch.nn.Module) -> None:
         attn_output = attn_output.to(hidden_states.dtype)
         attn_output = attn.o_proj(attn_output)
 
-        # Return new KV pair for cache
         new_kv = (k, v) if use_cache else None
         return (attn_output, new_kv)
 
@@ -414,6 +446,11 @@ async def main() -> None:
         default=None,
         help="Number of tokens per KV cache block",
     )
+
+    # ── Long context extension args ────────────────────────
+    from long_context import LongContextConfig  # noqa: PLC0415
+    _lc_config = LongContextConfig()
+    _lc_config.add_cli_args(parser)
     parser.add_argument(
         "--hidden-size",
         type=int,
@@ -470,6 +507,13 @@ async def main() -> None:
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # ---- Long context configuration ----
+    from long_context import LongContextConfig  # noqa: PLC0415
+    lc_config = LongContextConfig.from_cli(args)
+    if lc_config.enabled:
+        logger.info("Long context extension: %s (auto-enabled, use --disable-long-context to turn off)", lc_config)
+    set_long_context_config(lc_config)
 
     # ---- Load model ----
     tokenizer = None

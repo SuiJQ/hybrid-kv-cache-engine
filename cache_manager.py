@@ -9,6 +9,7 @@ Provides:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 from array import array
@@ -61,6 +62,7 @@ class HybridCache:
 
     _PREFETCH_FANOUT_MAX: int = 3
     _MEM_FRACTION: float = 0.50
+    _PROTECTED_N: int = 8      # number of head/tail tokens kept FP16
 
     def __init__(
         self,
@@ -98,8 +100,13 @@ class HybridCache:
 
         self._prefetch_stream: object | None = None
 
-        # BlockID → KV payload cache (list of (k_tensor, v_tensor) per layer)
-        self._block_kv_cache: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+        # BlockID → KV payload cache
+        # FP16 mode:   {"mode": "fp16", "kv": [(k, v), ...]}
+        # Mixed mode:  {"mode": "mixed", "seq_len": int,
+        #                "layers": [{k_head,v_head, k_body_q,k_body_scale,
+        #                            v_body_packed,v_body_scale,v_body_bias,
+        #                            k_tail,v_tail}, ...]}
+        self._block_kv_cache: dict[int, dict] = {}
 
         logger.info(
             "HybridCache initialized: block_size=%d, total_blocks=%d, mem_frac=%.2f",
@@ -260,10 +267,8 @@ class HybridCache:
         cache_key = (tuple(prompt_tokens[:8]), len(prompt_tokens))
         if cache_key in match_cache:
             block_id, matched_len = match_cache[cache_key]
-            try:
+            with contextlib.suppress(ValueError):
                 match_lru.remove(cache_key)
-            except ValueError:
-                pass
             match_lru.append(cache_key)
             if block_id is not None:
                 block = blocks.get(block_id)
@@ -273,10 +278,8 @@ class HybridCache:
                     # Stale cache entry — block was freed; invalidate and fall
                     # through to the fresh lookup path below.
                     match_cache.pop(cache_key, None)
-                    try:
+                    with contextlib.suppress(ValueError):
                         match_lru.remove(cache_key)
-                    except ValueError:
-                        pass
                 else:
                     if matched_len == len(prompt_tokens):
                         self._try_prefetch_children(block)
@@ -367,9 +370,8 @@ class HybridCache:
                         kv = child_block.kv_tensor
                         if kv is None:
                             continue
-                        # kv is now a list[tuple[tensor, tensor]]; skip prefetch
-                        # (HybridCache prefetch only supports single-Tensor blocks)
-                        if isinstance(kv, list):
+                        # Dict mode (quantized/fp16 list) — skip prefetch
+                        if isinstance(kv, dict):
                             continue
                         if kv.device.type != "cuda":
                             _ = kv.to(device="cuda", non_blocking=True)
@@ -378,9 +380,107 @@ class HybridCache:
         except Exception as _eexc:
             logger.warning("_try_prefetch_children unexpected error: %s", _eexc)
 
-    # ------------------------------------------------------------------
-    # KV cache storage / retrieval
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # KV asymmetric quantization kernels
+    #   Key  → INT8  symmetric (per-head scale)
+    #   Value→ INT4  packed asymmetric (symmetric→INT4 +8 bias, per-head)
+    # ==================================================================
+
+    @staticmethod
+    def _quantize_k_int8(
+        k: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize Key from FP16 to INT8 (per-head symmetric).
+
+        Args:
+            k: FP16 tensor, shape ``(1, H, T, D)``.
+        Returns:
+            (k_int8, scale) — int8 ``(1, H, T, D)``, fp16 ``(1, H, 1, 1)``.
+        """
+        amax = k.abs().amax(dim=(0, 2, 3), keepdim=True).clamp(min=1e-8)
+        scale = (amax / 127.0).to(torch.float16)
+        k_int8 = (k / scale).round().clamp(-128, 127).to(torch.int8)
+        return k_int8, scale
+
+    @staticmethod
+    def _dequantize_k_int8(
+        k_int8: torch.Tensor, scale: torch.Tensor
+    ) -> torch.Tensor:
+        """Dequantize Key from INT8 back to FP16."""
+        return k_int8.to(torch.float16) * scale
+
+    @staticmethod
+    def _quantize_v_int4(
+        v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize Value from FP16 to INT4 packed (per-head symmetric + bias).
+
+        Uses symmetric INT4 range [-8, 7] with +8 bias to get [0, 15],
+        then packs two uint4 values per byte.
+
+        Args:
+            v: FP16 tensor, shape ``(1, H, T, D)`` where D is even.
+        Returns:
+            (packed, scale, bias) —
+            - packed uint8 ``(1, H, T, D//2)``
+            - scale  fp16   ``(1, H, 1, 1)``
+            - bias   fp16   ``(1, H, 1, 1)``  (the +8 offset in real scale)
+        """
+        head_dim = v.shape[-1]
+        assert head_dim % 2 == 0, "head_dim must be even for INT4 packing"
+
+        amax = v.abs().amax(dim=(0, 2, 3), keepdim=True).clamp(min=1e-8)
+        # Scale maps ±7*scale to INT4 range [-8, 7]
+        scale = (amax / 7.0).to(torch.float16)
+        q = (v / scale).round().clamp(-8, 7).to(torch.int8)
+        q_biased = (q + 8).to(torch.uint8)  # now in [0, 15]
+
+        # Pack two uint4 per byte: [..., 2i] = low nibble, [..., 2i+1] = high nibble
+        *rest, d = q_biased.shape
+        d2 = d // 2
+        q_paired = q_biased.view(*rest, d2, 2)
+        packed = q_paired[..., 0] | (q_paired[..., 1] << 4)
+
+        # Bias is the +8 offset expressed in original value space
+        bias = (8.0 * scale).to(torch.float16)
+        return packed, scale, bias
+
+    @staticmethod
+    def _dequantize_v_int4(
+        packed: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor
+    ) -> torch.Tensor:
+        """Dequantize Value from INT4 packed back to FP16.
+
+        Args:
+            packed: uint8 ``(1, H, T, D//2)``.
+            scale:  fp16  ``(1, H, 1, 1)``.
+            bias:   fp16  ``(1, H, 1, 1)``.
+        Returns:
+            fp16 ``(1, H, T, D)``.
+        """
+        low = (packed & 0x0F).to(torch.float16)
+        high = ((packed >> 4) & 0x0F).to(torch.float16)
+        v0 = low * scale - bias
+        v1 = high * scale - bias
+        # Interleave: [v0[0], v1[0], v0[1], v1[1], ...]
+        return torch.stack([v0, v1], dim=-1).flatten(-2)
+
+    # ==================================================================
+    # Head/tail protection helpers
+    # ==================================================================
+
+    @property
+    def _protected_head_tail(self) -> int:
+        return self._PROTECTED_N
+
+    @staticmethod
+    def _needs_protected_storage(seq_len: int, protect_n: int) -> bool:
+        """True if seq_len is short enough that all positions are protected."""
+        return seq_len <= 2 * protect_n
+
+    # ==================================================================
+    # KV cache storage / retrieval (with asymmetric quantization)
+    # ==================================================================
 
     def store_kv(
         self,
@@ -391,20 +491,150 @@ class HybridCache:
 
         *layer_kv_pairs* is ``[(k_0, v_0), (k_1, v_1), ...]`` — one per
         decoder layer.  Tensors should already be on CUDA.
-        Note: References to these tensors must remain alive until
-        ``free_block`` is called.  The caller should NOT hold extra
-        references after storage to allow GC to reclaim.
+
+        If seq_len > 2 * PROTECTED_N, the middle body is quantized
+        (Key->INT8, Value->INT4 packed) while the first and last
+        PROTECTED_N positions stay FP16.
         """
-        self._block_kv_cache[block_id] = layer_kv_pairs
+        if not layer_kv_pairs:
+            self._block_kv_cache.pop(block_id, None)
+            return
+
+        protect_n = self._PROTECTED_N
+        k0 = layer_kv_pairs[0][0]
+        seq_len = k0.shape[2]
+
+        if self._needs_protected_storage(seq_len, protect_n):
+            # ── FP16 mode (too short to split) ──
+            stored = {"mode": "fp16", "kv": layer_kv_pairs}
+        else:
+            # ── Mixed mode: head FP16 + body quantized + tail FP16 ──
+            layers_stored = []
+            for k, v in layer_kv_pairs:
+                k_head = k[:, :, :protect_n, :].contiguous()
+                v_head = v[:, :, :protect_n, :].contiguous()
+                k_tail = k[:, :, -protect_n:, :].contiguous()
+                v_tail = v[:, :, -protect_n:, :].contiguous()
+
+                k_body = k[:, :, protect_n:-protect_n, :].contiguous()
+                v_body = v[:, :, protect_n:-protect_n, :].contiguous()
+
+                k_body_q, k_scale = self._quantize_k_int8(k_body)
+                v_packed, v_scale, v_bias = self._quantize_v_int4(v_body)
+
+                layers_stored.append({
+                    "k_head": k_head,
+                    "v_head": v_head,
+                    "k_body_q": k_body_q,
+                    "k_body_scale": k_scale,
+                    "v_body_packed": v_packed,
+                    "v_body_scale": v_scale,
+                    "v_body_bias": v_bias,
+                    "k_tail": k_tail,
+                    "v_tail": v_tail,
+                })
+
+            stored = {"mode": "mixed", "seq_len": seq_len, "layers": layers_stored}
+
+        self._block_kv_cache[block_id] = stored
         block = self.allocated_blocks.get(block_id)
         if block is not None:
-            block.kv_tensor = layer_kv_pairs
+            block.kv_tensor = stored
 
     def load_kv(
         self, block_id: int
     ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
-        """Retrieve stored per-layer KV tensors for a block, or None."""
-        return self._block_kv_cache.get(block_id)
+        """Retrieve stored per-layer KV tensors for a block, or None.
+
+        Quantized body is transparently dequantized back to FP16 on load.
+        """
+        stored = self._block_kv_cache.get(block_id)
+        if stored is None:
+            return None
+
+        if stored["mode"] == "fp16":
+            return stored["kv"]
+
+        # Mixed mode: dequantize body, concat head + body + tail
+        result = []
+        for layer in stored["layers"]:
+            k_body = self._dequantize_k_int8(layer["k_body_q"], layer["k_body_scale"])
+            v_body = self._dequantize_v_int4(
+                layer["v_body_packed"], layer["v_body_scale"], layer["v_body_bias"]
+            )
+            k_out = torch.cat([layer["k_head"], k_body, layer["k_tail"]], dim=2)
+            v_out = torch.cat([layer["v_head"], v_body, layer["v_tail"]], dim=2)
+            result.append((k_out, v_out))
+
+        return result
+
+    def load_kv_stats(
+        self, block_id: int
+    ) -> dict:
+        """Diagnostic: return storage mode, seq_len, and byte savings for a block.
+
+        Returns
+        -------
+        dict with keys:
+          mode, seq_len, fp16_bytes, stored_bytes, saving_ratio
+        or empty dict if block not found.
+        """
+        stored = self._block_kv_cache.get(block_id)
+        if stored is None:
+            return {}
+
+        if stored["mode"] == "fp16":
+            kv = stored["kv"]
+            num_positions = 0
+            element_count = 0
+            if kv:
+                num_positions = kv[0][0].shape[2]
+                num_heads = kv[0][0].shape[1]
+                head_dim = kv[0][0].shape[3]
+                num_layers = len(kv)
+                element_count = num_layers * 2 * num_positions * num_heads * head_dim
+            return {
+                "mode": "fp16",
+                "seq_len": num_positions,
+                "fp16_bytes": element_count * 2,
+                "stored_bytes": element_count * 2,
+                "saving_ratio": 1.0,
+            }
+
+        # Mixed mode
+        protect_n = self._PROTECTED_N
+        seq_len = stored["seq_len"]
+        num_layers = len(stored["layers"])
+        if not stored["layers"]:
+            return {"mode": "mixed", "seq_len": seq_len, "fp16_bytes": 0, "stored_bytes": 0}
+
+        head_dim = stored["layers"][0]["k_head"].shape[3]
+        num_heads = stored["layers"][0]["k_head"].shape[1]
+        body_len = seq_len - 2 * protect_n
+
+        # FP16 baseline: 2 bytes per element, K+V = 2 tensors
+        fp16_elements = num_layers * 2 * seq_len * num_heads * head_dim
+        fp16_bytes = fp16_elements * 2
+
+        # Stored: head+tail FP16 + body quantized
+        # Head+tail: 2*protect_n positions FP16 per K and V
+        # Body K: body_len * num_heads * head_dim * 1 byte (INT8) + scale (num_heads * 2 bytes)
+        # Body V: body_len * num_heads * head_dim/2 * 1 byte (packed) + scale+bias (num_heads * 2 bytes * 2)
+        head_tail_elements = 2 * protect_n * num_heads * head_dim
+        head_tail_bytes = head_tail_elements * 2 * num_layers * 2  # K+V
+        body_k_bytes = body_len * num_heads * head_dim * num_layers  # INT8
+        body_k_scale_bytes = num_heads * 2 * num_layers  # fp16 scale
+        body_v_bytes = body_len * num_heads * (head_dim // 2) * num_layers  # uint4 packed
+        body_v_meta_bytes = num_heads * 2 * 2 * num_layers  # fp16 scale + bias
+        stored_bytes = head_tail_bytes + body_k_bytes + body_k_scale_bytes + body_v_bytes + body_v_meta_bytes
+
+        return {
+            "mode": "mixed",
+            "seq_len": seq_len,
+            "fp16_bytes": fp16_bytes,
+            "stored_bytes": stored_bytes,
+            "saving_ratio": stored_bytes / max(fp16_bytes, 1),
+        }
 
     # ------------------------------------------------------------------
     # Free / reference-count management
