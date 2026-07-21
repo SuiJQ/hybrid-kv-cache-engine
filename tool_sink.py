@@ -150,7 +150,12 @@ def format_fixer(raw: str) -> str:
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Stage 3: try stripping trailing garbage
+    # Stage 3: if no JSON structure characters exist, return as-is
+    # (pure natural language should not be truncated)
+    if '{' not in cleaned and '[' not in cleaned:
+        return cleaned
+
+    # Stage 4: try stripping trailing garbage
     # Scan backwards through the string to find the last valid JSON
     for end in range(len(cleaned), 0, -1):
         candidate = cleaned[:end]
@@ -971,42 +976,116 @@ class ToolContext:
         return {"query": args_str}
 
     @staticmethod
+    @staticmethod
     def _parse_key_value(text: str) -> dict[str, Any] | None:
         """Parse ``key="value", key2=123`` style keyword arguments.
 
-        Returns a dict or None on parse failure.
+        Uses a character-level parser that tracks parenthesis/bracket
+        depth, so nested function calls and list literals containing
+        commas are handled correctly.
+
+        Examples:
+        - ``expression=math.sin(1.0)`` → {"expression": "math.sin(1.0)"}
+        - ``code=print(1), flag=True`` → {"code": "print(1)", "flag": True}
+        - ``expression=average([1, 2], [3, 4])`` → {"expression": "average([1, 2], [3, 4])"}
         """
         result: dict[str, Any] = {}
-        # Match key=value pairs, handling quoted and unquoted values
-        # Pattern: key = "quoted value" OR key = unquoted_value OR key = 123
-        # The trailing ",\s*" consumes the comma AND any whitespace after
-        # it, so the next match starts on the next key name.
-        pattern = re.compile(
-            r'(\w+)\s*=\s*'
-            r'(?:"([^"]*)"|'         # double-quoted
-            r"'([^']*)'|"             # single-quoted
-            r'([^,\s][^,]*?))'        # unquoted (up to comma or end)
-            r'\s*(?:,\s*|$)'
-        )
-        pos = 0
-        while pos < len(text):
-            m = pattern.match(text, pos)
-            if not m:
+        i = 0
+        n = len(text)
+
+        while i < n:
+            # Skip whitespace
+            while i < n and text[i] in ' \t':
+                i += 1
+            if i >= n:
+                break
+
+            # Match key
+            key_match = re.match(r'(\w+)\s*=', text[i:])
+            if not key_match:
                 return None
-            key = m.group(1)
-            # Value: one of the alternations should match
-            value = (m.group(2) or m.group(3) or m.group(4) or '').strip()
+            key = key_match.group(1)
+            i += key_match.end()
+
+            if i >= n:
+                return None
+
+            # Parse value (handles quoted, unquoted, with balanced nesting)
+            value_str, i = ToolContext._parse_value_chars(text, i)
+
             # Try to coerce numeric values
             try:
-                if '.' in value or 'e' in value.lower():
-                    value = float(value)
+                if '.' in value_str or 'e' in value_str.lower():
+                    result[key] = float(value_str)
+                elif value_str.isdigit() or (value_str.startswith('-') and value_str[1:].isdigit()):
+                    result[key] = int(value_str)
                 else:
-                    value = int(value)
+                    result[key] = value_str
             except (ValueError, TypeError):
-                pass  # Keep as string
-            result[key] = value
-            pos = m.end()
+                result[key] = value_str
+
+            # Skip comma separator
+            while i < n and text[i] in ' \t':
+                i += 1
+            if i < n and text[i] == ',':
+                i += 1
+
         return result if result else None
+
+    @staticmethod
+    def _parse_value_chars(text: str, start: int) -> tuple[str, int]:
+        """Parse a single value from position ``start``, handling quoted
+        strings and balanced parentheses/brackets.
+
+        Returns (parsed_value_string, new_position).
+        """
+        if start >= len(text):
+            return '', start
+
+        ch = text[start]
+
+        # Double-quoted string
+        if ch == '"':
+            end = text.find('"', start + 1)
+            if end == -1:
+                return text[start + 1:].strip(), len(text)
+            return text[start + 1:end].strip(), end + 1
+
+        # Single-quoted string
+        if ch == "'":
+            end = text.find("'", start + 1)
+            if end == -1:
+                return text[start + 1:].strip(), len(text)
+            return text[start + 1:end].strip(), end + 1
+
+        # Unquoted: track nesting depth
+        depth = 0
+        end = start
+        while end < len(text):
+            c = text[end]
+            if c in '([':
+                depth += 1
+            elif c in ')]':
+                depth -= 1
+            elif c == ',' and depth == 0:
+                # Comma at top-level — end of this value
+                break
+            elif c == ' ' and depth == 0:
+                # Space at top-level: check if it's a separator
+                rest = text[end:].lstrip()
+                if not rest:
+                    # End of string
+                    break
+                if rest[0] == ',':
+                    # Trailing space before comma
+                    break
+                if re.match(r'\w+\s*=', rest):
+                    # Next key=value pair starting
+                    break
+                # Otherwise it's part of the (space-containing) value
+            end += 1
+
+        return text[start:end].strip(), end
 
     @staticmethod
     def _serialize_result(result: Any) -> str:

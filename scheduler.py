@@ -854,7 +854,7 @@ class UnifiedScheduler:
         old_len = len(req.tokens)
         sink_n = self._COMPRESS_SINK_N
         recent_n = self._COMPRESS_RECENT_N
-        if old_len <= sink_n + recent_n:
+        if old_len <= sink_n + recent_n + 2:
             return
 
         # [AFCE] Clear orphan sidecar for old hash
@@ -1171,7 +1171,7 @@ class UnifiedScheduler:
         spec_stream = self.decode_stream
 
         for req in list(self.active_decode_pool):
-            if req.is_done:
+            if req.is_done or req.request_id in self._spec_handled:
                 continue
 
             context = req.tokens

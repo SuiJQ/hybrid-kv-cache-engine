@@ -10,6 +10,7 @@ Provides:
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import hashlib
 import logging
@@ -103,9 +104,17 @@ class HybridCache:
         self._hash_tree: dict[str, list[str]] = {}
 
         # [Bug 9] LRU cache keyed on tuple of first 8 tokens, not hash().
+        # Using OrderedDict for O(1) LRU operations.
         self._match_cache: dict[tuple, tuple[int | None, int]] = {}
         self._match_cache_lru: list[tuple] = []
         self._match_cache_max = 256
+        try:
+            from collections import OrderedDict as _OD
+            self._match_cache = _OD()
+            self._match_cache_lru = None  # replaced by OrderedDict
+        except ImportError:
+            self._match_cache = {}
+            self._match_cache_lru = []
 
         # Prefix caching: ordered list of pinned block IDs (oldest first)
         self._pinned_lru: list[int] = []
@@ -400,11 +409,21 @@ class HybridCache:
         # Use tuple of (first 8 tokens, total length) as cache key so that
         # different prompts with the same first 8 tokens don't collide.
         cache_key = (tuple(prompt_tokens[:8]), len(prompt_tokens))
+
+        # Handle both OrderedDict (O(1)) and legacy list (O(n)) LRU
+        _using_od = isinstance(match_cache, collections.OrderedDict)
+
         if cache_key in match_cache:
             block_id, matched_len = match_cache[cache_key]
-            with contextlib.suppress(ValueError):
-                match_lru.remove(cache_key)
-            match_lru.append(cache_key)
+
+            if _using_od:
+                # OrderedDict LRU: move to end (most recently used)
+                match_cache.move_to_end(cache_key, last=True)
+            else:
+                with contextlib.suppress(ValueError):
+                    match_lru.remove(cache_key)
+                    match_lru.append(cache_key)
+
             if block_id is not None:
                 block = blocks.get(block_id)
                 if block is not None:
@@ -413,8 +432,9 @@ class HybridCache:
                     # Stale cache entry — block was freed; invalidate and fall
                     # through to the fresh lookup path below.
                     match_cache.pop(cache_key, None)
-                    with contextlib.suppress(ValueError):
-                        match_lru.remove(cache_key)
+                    if not _using_od:
+                        with contextlib.suppress(ValueError):
+                            match_lru.remove(cache_key)
                 else:
                     if matched_len == len(prompt_tokens):
                         self._try_prefetch_children(block)
@@ -449,11 +469,16 @@ class HybridCache:
             prev_candidates = consistent
 
         result = (last_matched_block_id, split_index)
-        match_cache[cache_key] = result
-        match_lru.append(cache_key)
-        if len(match_lru) > self._match_cache_max:
-            old_key = match_lru.pop(0)
-            match_cache.pop(old_key, None)
+        if _using_od:
+            match_cache[cache_key] = result
+            if len(match_cache) > self._match_cache_max:
+                match_cache.popitem(last=False)
+        else:
+            match_cache[cache_key] = result
+            match_lru.append(cache_key)
+            if len(match_lru) > self._match_cache_max:
+                old_key = match_lru.pop(0)
+                match_cache.pop(old_key, None)
 
         if last_matched_block_id is not None:
             block = blocks.get(last_matched_block_id)
