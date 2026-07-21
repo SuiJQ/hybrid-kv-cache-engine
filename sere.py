@@ -15,15 +15,69 @@ logger = logging.getLogger(__name__)
 
 
 class SEREModule:
-    """Dynamic Expert Skip (SERE) — post-routing token redirection."""
+    """Dynamic Expert Skip (SERE) — post-routing token redirection.
+
+    All parameters are auto-tuned by default via ``auto_tune()``.
+    Manual override is always possible by passing values explicitly.
+    """
+
+    @staticmethod
+    def auto_tune(
+        num_experts: int,
+        top_k: int = 2,
+    ) -> tuple[float, int]:
+        """Auto-tune skip_threshold and min_experts from model config.
+
+        Rules:
+        - With more experts → more aggressive skipping (lower threshold).
+          MoE-64 can skip more aggressively than MoE-8.
+        - min_experts = clamp(1 to top_k-1): never skip below 1 active
+          expert, but never skip all non-primary experts either.
+        - For top_k=1 there is nothing to skip.
+
+        Returns (skip_threshold, min_experts).
+        """
+        if top_k <= 1:
+            return (0.0, 1)
+
+        # Base threshold decreases with more experts (more opportunity to skip)
+        base = 0.15
+        if num_experts >= 64:
+            threshold = base * 0.6   # 0.09
+        elif num_experts >= 32:
+            threshold = base * 0.8   # 0.12
+        elif num_experts >= 16:
+            threshold = base * 1.0   # 0.15
+        else:
+            threshold = base * 1.2   # 0.18  — fewer experts, be conservative
+
+        # Higher top_k → can be more aggressive
+        if top_k >= 4:
+            threshold *= 0.85
+        elif top_k >= 3:
+            threshold *= 0.95
+
+        # min_experts: always keep at least 1, but up to half of top_k
+        min_exp = max(1, min(top_k // 2, top_k - 1))
+
+        logger.info(
+            "SERE auto_tune: num_experts=%d, top_k=%d → threshold=%.4f, min_experts=%d",
+            num_experts, top_k, threshold, min_exp,
+        )
+        return (threshold, min_exp)
 
     def __init__(
         self,
         num_experts: int,
         top_k: int = 2,
-        skip_threshold: float = 0.15,
-        min_experts: int = 1,
+        skip_threshold: float | None = None,
+        min_experts: int | None = None,
     ):
+        # Auto-tune if not explicitly provided
+        if skip_threshold is None or min_experts is None:
+            _st, _me = self.auto_tune(num_experts, top_k)
+            skip_threshold = skip_threshold if skip_threshold is not None else _st
+            min_experts = min_experts if min_experts is not None else _me
         self.num_experts = num_experts
         self.top_k = top_k
         self.skip_threshold = skip_threshold

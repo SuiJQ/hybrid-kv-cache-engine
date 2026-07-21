@@ -122,10 +122,10 @@ python -c "import torch" 2>nul
 if %errorlevel% neq 0 (
     echo %YELLOW%[~]%NC% 正在安装 PyTorch（约需几分钟）...
     pip install --quiet --upgrade pip
-    pip install --quiet torch==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+    pip install --quiet torch==2.13.0 
     if !errorlevel! neq 0 (
         echo %YELLOW%[~]%NC% CUDA 版安装失败,尝试 CPU 版...
-        pip install --quiet torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+        pip install --quiet torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
     )
     echo %GREEN%[✓]%NC% PyTorch 安装完成
 ) else (

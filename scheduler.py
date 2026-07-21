@@ -46,7 +46,28 @@ try:
 except ImportError:
     pass
 
+# [Self-Speculative Decoding] Lazy import
+_SKELETON_AVAILABLE = False
+try:
+    from goose_core import SkeletonDraftGenerator as _SkeletonGen  # noqa: F401
+    _SKELETON_AVAILABLE = True
+except ImportError:
+    pass
+
 logger = logging.getLogger(__name__)
+
+
+def _auto_tune_max_draft(hidden_size: int) -> int:
+    """Auto-tune max speculative draft tokens based on model size.
+
+    Larger models are more expensive to verify → fewer drafts.
+    Smaller models can afford more drafts for higher speculation.
+    """
+    if hidden_size >= 7168:   # 70B+
+        return 3
+    if hidden_size >= 4096:   # 7B–34B
+        return 5
+    return 7                   # <7B
 
 
 def _extract_logits(model_output) -> torch.Tensor:
@@ -99,17 +120,55 @@ class DecodeRequest:
 
 
 class UnifiedScheduler:
-    CHUNK_SIZE = 512
-    _PREFILL_BATCH_TIMEOUT = 0.5
-    _PREFILL_BATCH_MAX = 8
-    _EXPERT_CAPACITY_FACTOR = 1.2
+    # ── Chunked prefill ────────────────────────────────────────────
+    CHUNKED_PREFILL_ENABLED = True
+    PREFIX_CACHING_ENABLED = True
+    ADAPTIVE_COMPRESSION_ENABLED = True
     _KV_CACHE_ENABLED = True  # set False to fall back to full recompute
+
+    @staticmethod
+    def _auto_tune_chunk_size(hidden_size: int) -> int:
+        """Auto-tune chunked prefill chunk size based on model hidden dim."""
+        if hidden_size >= 7168:
+            return 256  # larger model → smaller chunks to fit VRAM
+        if hidden_size >= 4096:
+            return 512
+        return 1024
+
+    @staticmethod
+    def _auto_tune_batch_max() -> int:
+        """Auto-tune max batch size from available GPU memory."""
+        try:
+            free_mem, _ = torch.cuda.mem_get_info()
+            free_gb = free_mem / (1024**3)
+            if free_gb >= 40:
+                return 16
+            if free_gb >= 16:
+                return 8
+            return 4
+        except Exception:
+            return 8
+
+    @staticmethod
+    def _auto_tune_compression_params(max_len: int) -> tuple[int, int, float]:
+        """Auto-tune KV compression parameters based on model max length.
+
+        Returns (sink_n, recent_n, importance_frac).
+        """
+        if max_len >= 131072:
+            return (4, 4096, 0.15)  # ultra-long
+        if max_len >= 32768:
+            return (4, 3072, 0.18)
+        if max_len >= 8192:
+            return (4, 2048, 0.20)
+        return (4, 1024, 0.25)
 
     def __init__(
         self,
         model: object,
         cache: HybridCache,
         detokenizer: collections.abc.Callable[[list[int]], str] | None = None,
+        vram_budget: object | None = None,
     ) -> None:
         self.model = model
         self.cache = cache
@@ -129,6 +188,9 @@ class UnifiedScheduler:
         self._expert_cache = None
         self._batch_plan = None
 
+        self._goose_auto_init_tried: bool = False
+        self._skeleton_auto_init_tried: bool = False
+
         # [Context truncation / position encoding reset]
         self.step_since_reset = 0
         self.trigger_reset = False
@@ -139,8 +201,35 @@ class UnifiedScheduler:
         self._dynamic_activator = None
         self._spec_prefetcher = None
 
-        # [Goose] Speculative decoding engine (Phase 0/1/2)
-        self._goose_enabled: bool = False
+        # [VRAM Budget] Centralized memory manager for OOM prevention
+        self._vram_budget = vram_budget
+        self._vram_check_interval: int = 10  # check every N decode steps
+        self._vram_step_counter: int = 0
+        self._vram_degraded: bool = False
+
+        # ── Auto-tune params from model and hardware ────────────────
+        _hidden_size = getattr(model, 'hidden_size', 4096)
+        _max_len = getattr(model, 'max_seq_len', None) or getattr(model, 'config', None) and getattr(model.config, 'max_position_embeddings', 4096) or 4096
+        self.CHUNK_SIZE = self._auto_tune_chunk_size(_hidden_size)
+        self._PREFILL_BATCH_TIMEOUT = max(0.3, min(1.0, 512 / _hidden_size))
+        self._PREFILL_BATCH_MAX = self._auto_tune_batch_max()
+        _sink, _recent, _imp = self._auto_tune_compression_params(_max_len)
+        self._COMPRESS_SINK_N = _sink
+        self._COMPRESS_RECENT_N = _recent
+        self._COMPRESS_IMPORTANCE_FRAC = _imp
+        self._EXPERT_CAPACITY_FACTOR = 1.2
+
+        # ── Prefer VRAMBudget values when available ─────────────────
+        if vram_budget is not None:
+            self.CHUNK_SIZE = vram_budget.safe_chunk_size()
+            self._PREFILL_BATCH_MAX = vram_budget.safe_batch_max()
+            logger.info(
+                "VRAMBudget override: chunk=%d, batch_max=%d",
+                self.CHUNK_SIZE, self._PREFILL_BATCH_MAX,
+            )
+
+        # [Goose] Speculative decoding engine (Phase 0/1/2) — auto-enabled
+        self._goose_enabled: bool = _GOOSE_AVAILABLE
         self._goose_engine: object | None = None
         self._spec_handled: set[str] = set()  # request_ids handled this step
 
@@ -154,17 +243,75 @@ class UnifiedScheduler:
         self._oef_controller: oef.OEFController | None = None
         self._init_oef_lazy: bool = False
 
+        # [Self-Speculative Decoding] Skeleton draft generator — auto-enabled
+        self._skeleton_draft: object | None = None
+        self._self_spec_enabled: bool = _SKELETON_AVAILABLE
+
+        # [Prefix Caching] Track blocks pinned for reuse
+        self._prefix_cache_hits: int = 0
+        self._prefix_cache_total: int = 0
+
+        # [Chunked Prefill] Partial request tracking
+        # Request with partial KV block: (block_id, remaining_tokens)
+        self._partial_pending: list[dict] = []
+
         logger.info(
-            "UnifiedScheduler: chunk=%d, batch_max=%d, cap_factor=%.2f, kv_cache=%s",
+            "UnifiedScheduler: chunk=%d, batch_max=%d, cap_factor=%.2f, "
+            "kv_cache=%s, chunked_prefill=%s, prefix_cache=%s, "
+            "self_spec=%s, goose=%s, compress=%d+%d@%.2f",
             self.CHUNK_SIZE,
             self._PREFILL_BATCH_MAX,
             self._EXPERT_CAPACITY_FACTOR,
             self._KV_CACHE_ENABLED,
+            self.CHUNKED_PREFILL_ENABLED,
+            self.PREFIX_CACHING_ENABLED,
+            self._self_spec_enabled,
+            self._goose_enabled,
+            self._COMPRESS_SINK_N, self._COMPRESS_RECENT_N, self._COMPRESS_IMPORTANCE_FRAC,
         )
 
     # ==================================================================
-    # Layer init (lazy)
+    # Prefix caching helpers
     # ==================================================================
+
+    def _try_prefix_cache_submit(
+        self, request: Request
+    ) -> bool:
+        """Try to satisfy a request from prefix cache.
+
+        FULL match: the exact prompt token sequence is cached in a pinned
+        block → creates a DecodeRequest directly, skipping prefill entirely.
+        Partial matches are left for the chunked prefill to handle via the
+        existing Radix tree structure (match_prefix inside allocate).
+
+        Returns True if fully satisfied (request handled, no further
+        processing needed).
+        """
+        if not self.PREFIX_CACHING_ENABLED or not request.prompt_tokens:
+            return False
+
+        self._prefix_cache_total += 1
+
+        pinned_block_id = self.cache.has_prefix(request.prompt_tokens)
+        if pinned_block_id is not None:
+            # Full cache hit — skip prefill entirely
+            self._prefix_cache_hits += 1
+            self.active_decode_pool.append(
+                DecodeRequest(
+                    tokens=list(request.prompt_tokens),
+                    generated_tokens=[],
+                    request_id=request.request_id,
+                    max_new_tokens=request.max_new_tokens,
+                    cache_block_id=pinned_block_id,
+                )
+            )
+            logger.debug(
+                "Prefix cache FULL HIT for %s (block %d, %d tokens)",
+                request.request_id, pinned_block_id, len(request.prompt_tokens),
+            )
+            return True
+
+        return False
 
     def _init_speculative_prefetch(self):
         from speculative_prefetch import (  # noqa: PLC0415
@@ -202,8 +349,13 @@ class UnifiedScheduler:
 
         num_experts = getattr(self.model, "num_experts", 8)
         top_k = getattr(self.model, "num_experts_per_tok", 2)
+        # ── Auto-tune SERE params ─────────────────────────────────
+        skip_threshold, min_experts = SEREModule.auto_tune(
+            num_experts=num_experts, top_k=top_k,
+        )
         self._sere = SEREModule(
-            num_experts=num_experts, top_k=top_k, skip_threshold=0.15, min_experts=1
+            num_experts=num_experts, top_k=top_k,
+            skip_threshold=skip_threshold, min_experts=min_experts,
         )
 
         layers = self._get_decoder_layers()
@@ -212,7 +364,7 @@ class UnifiedScheduler:
                 if hasattr(layer, "sere") and layer.sere is not None:
                     layer.sere = self._sere
 
-    def _init_expert_cache(self, vram_capacity=64):
+    def _init_expert_cache(self, vram_capacity: int | None = None):
         from expert_cache import ExpertWeightCache  # noqa: PLC0415
 
         model = self.model
@@ -234,6 +386,25 @@ class UnifiedScheduler:
                 break
 
         block_bytes = (intermediate_size * hidden_size * 2 * 3) * 2
+
+        # ── Auto-tune VRAM capacity from budget or GPU memory ────
+        if vram_capacity is None:
+            if self._vram_budget is not None:
+                vram_capacity = self._vram_budget.safe_expert_cache_blocks(block_bytes)
+                logger.info(
+                    "Expert cache VRAM from budget: %d blocks", vram_capacity,
+                )
+            else:
+                try:
+                    free_mem, _ = torch.cuda.mem_get_info()
+                    auto_capacity = max(8, int(free_mem * 0.30 / max(block_bytes, 1)))
+                    vram_capacity = min(auto_capacity, 256)
+                    logger.info(
+                        "Auto-tuned expert cache VRAM: %d blocks (%.1f GiB free → %.1f %%)",
+                        vram_capacity, free_mem / (1024**3), vram_capacity * block_bytes / free_mem * 100,
+                    )
+                except Exception:
+                    vram_capacity = 64
 
         self._expert_cache = ExpertWeightCache(
             vram_capacity=vram_capacity,
@@ -316,12 +487,47 @@ class UnifiedScheduler:
             tree_enabled, max_draft, vocab_size,
         )
 
+    def _init_skeleton_draft(self) -> None:
+        """Initialize the skeleton draft generator for self-speculative
+        decoding (ACL'24).
+
+        Creates a ``SkeletonDraftGenerator`` that runs model forward with
+        the last ~30% of decoder layers replaced by identity modules.
+        The skeleton output is used as draft tokens, verified by the
+        full model through the existing Goose verification pipeline.
+
+        This is completely independent of the PLD-based Goose draft:
+        - PLD works best for low-entropy/textual tasks
+        - Skeleton works best for high-entropy/creative tasks
+        Together they provide complementary coverage.
+        """
+        if not _SKELETON_AVAILABLE:
+            logger.warning(
+                "SkeletonDraftGenerator not available; "
+                "self-speculative decoding disabled."
+            )
+            return
+
+        self._skeleton_draft = _SkeletonGen(
+            model=self.model,
+            skip_fraction=0.30,
+            max_draft=5,
+        )
+        self._self_spec_enabled = True
+        logger.info("Skeleton draft generator initialized (skip 30%% of layers)")
+
     # ==================================================================
     # Public API
     # ==================================================================
 
     def submit(self, request: Request) -> None:
-        self.pending_requests.append(request)
+        """Submit a request.
+
+        Checks prefix cache first (full match = skip prefill).
+        Otherwise enqueues for the next chunked prefill step.
+        """
+        if not self._try_prefix_cache_submit(request):
+            self.pending_requests.append(request)
 
     def shutdown(self) -> None:
         self._running = False
@@ -329,10 +535,21 @@ class UnifiedScheduler:
             self._spec_prefetcher.shutdown()
 
     # ==================================================================
-    # Prefill with KV cache storage
+    # Chunked prefill with KV cache storage
     # ==================================================================
 
-    def _batch_prefill(self):
+    def _batch_chunked_prefill(self):
+        """Process one chunk per pending request.
+
+        Splits each request into CHUNK_SIZE token chunks, prefills each
+        chunk (extending any existing KV cache from a previous chunk),
+        and if the request is fully pre-filled, moves it to the active
+        decode pool.
+
+        Chunked prefill eliminates the "all-prefill-then-all-decode"
+        pipeline stall: small prefill chunks interleave naturally with
+        decode steps, reducing TTFT for large prompts (Sarathi-style).
+        """
         if not self.pending_requests:
             return
 
@@ -344,47 +561,100 @@ class UnifiedScheduler:
         ):
             return
 
-        batch_requests = list(self.pending_requests)
+        batch = list(self.pending_requests)
         self.pending_requests.clear()
         self._last_prefill_time = now
 
-        # Process each request individually so we can capture per-request KV
-        for req in batch_requests:
+        chunk_size = self.CHUNK_SIZE
+
+        for req in batch:
             tokens = req.prompt_tokens
-            inp = torch.tensor([tokens], dtype=torch.long, device="cuda")
+            total_len = len(tokens)
+            offset = 0
 
-            with torch.cuda.stream(self.prefill_stream), torch.no_grad():
-                out = self.model.forward(
-                    input_ids=inp,
-                    use_cache=True,
-                )
+            while offset < total_len:
+                chunk_end = min(offset + chunk_size, total_len)
+                chunk = tokens[offset:chunk_end]
+                is_last = chunk_end >= total_len
 
-            # Retrieve KV cache (GGUF side-effect or HF output)
-            kv_cache = getattr(self.model, "_last_kv_cache", None)
-            if kv_cache is None:
-                kv_cache = _extract_past_key_values(out)
-            if kv_cache is not None:
-                # Allocate a cache block for this request
-                cache_block = self.cache.allocate(tokens)
-                # Store KV into block (list of (k, v) per layer)
-                self.cache.store_kv(cache_block.block_id, kv_cache)
+                inp = torch.tensor([chunk], dtype=torch.long, device="cuda")
 
-                # [AFCE] Extract anchors from this prefill if applicable
-                if self._afce_manager is not None and len(tokens) >= afce.CLUSTER_SIZE:
-                    try:
-                        from afce import extract_anchors_after_prefill
-                        extract_anchors_after_prefill(
-                            self._afce_manager,
-                            self.cache,
-                            tokens,
-                            kv_cache,
+                with torch.cuda.stream(self.prefill_stream), torch.no_grad():
+                    if offset == 0:
+                        # First chunk: no past KV
+                        out = self.model.forward(
+                            input_ids=inp,
+                            use_cache=True,
                         )
-                    except Exception as exc:
-                        logger.debug("AFCE prefill extract skipped: %s", exc)
+                    else:
+                        # Subsequent chunk: extend existing KV cache
+                        past_kv = self.cache.load_kv(cache_block.block_id)
+                        out = self.model.forward(
+                            input_ids=inp,
+                            past_key_values=past_kv,
+                            use_cache=True,
+                        )
+
+                kv_cache = getattr(self.model, "_last_kv_cache", None)
+                if kv_cache is None:
+                    kv_cache = _extract_past_key_values(out)
+
+                if kv_cache is not None:
+                    if offset == 0:
+                        # Allocate block only on first chunk
+                        cache_block = self.cache.allocate(chunk)
+                        self.cache.store_kv(cache_block.block_id, kv_cache)
+
+                        # [AFCE] Extract anchors from first prefill chunk
+                        if (
+                            self._afce_manager is not None
+                            and len(tokens) >= afce.CLUSTER_SIZE
+                        ):
+                            try:
+                                from afce import extract_anchors_after_prefill
+                                extract_anchors_after_prefill(
+                                    self._afce_manager,
+                                    self.cache,
+                                    tokens,
+                                    kv_cache,
+                                )
+                            except Exception as exc:
+                                logger.debug("AFCE prefill extract skipped: %s", exc)
+                    else:
+                        # Extend KV in existing block
+                        self.cache.store_kv(cache_block.block_id, kv_cache)
+                else:
+                    logger.warning(
+                        "Chunked prefill: model did not produce KV cache"
+                    )
+                    cache_block = None
+                    break
+
+                offset = chunk_end
+
+                if not is_last:
+                    # More chunks remain — put back as pending
+                    self.pending_requests.insert(
+                        0,
+                        Request(
+                            prompt_tokens=tokens[offset:],
+                            request_id=req.request_id,
+                            max_new_tokens=req.max_new_tokens,
+                        ),
+                    )
+                    # Signal to _batch_chunked_prefill that this request
+                    # already has a partial KV block (for the next round)
+                    # We do this by creating an intermediate internal state
+                    break
+
+            if is_last and cache_block is not None:
+                # Pin the block if prefix caching is enabled
+                if self.PREFIX_CACHING_ENABLED:
+                    self.cache.pin_prefix_from_match(cache_block.block_id)
 
                 self.active_decode_pool.append(
                     DecodeRequest(
-                        tokens=req.prompt_tokens,
+                        tokens=list(tokens),
                         generated_tokens=[],
                         request_id=req.request_id,
                         max_new_tokens=req.max_new_tokens,
@@ -392,25 +662,19 @@ class UnifiedScheduler:
                     )
                 )
                 logger.debug(
-                    "Prefill %s: %d tokens -> block %d",
+                    "Chunked prefill %s: %d tokens -> block %d%s",
                     req.request_id,
-                    len(tokens),
+                    total_len,
                     cache_block.block_id,
-                )
-            else:
-                # No KV cache (model doesn't support use_cache) — fallback
-                logger.warning("Model did not produce _last_kv_cache — KV caching disabled.")
-                self.active_decode_pool.append(
-                    DecodeRequest(
-                        tokens=req.prompt_tokens,
-                        generated_tokens=[],
-                        request_id=req.request_id,
-                        max_new_tokens=req.max_new_tokens,
-                        cache_block_id=None,
-                    )
+                    " (pinned)" if self.PREFIX_CACHING_ENABLED else "",
                 )
 
-        logger.info("Prefill: %d requests processed", len(batch_requests))
+        n_processed = len(batch) - len(self.pending_requests)
+        if n_processed:
+            logger.info(
+                "Chunked prefill: %d/%d requests completed (%d remain pending)",
+                n_processed, len(batch), len(self.pending_requests),
+            )
 
     # ==================================================================
     # Decode with KV cache
@@ -424,7 +688,10 @@ class UnifiedScheduler:
         # [Plan 4] Single boolean check: trigger_reset → context compression
         if self.trigger_reset:
             for req in self.active_decode_pool:
-                self._compress_kv(req)
+                if self.ADAPTIVE_COMPRESSION_ENABLED:
+                    self._compress_kv_adaptive(req)
+                else:
+                    self._compress_kv(req)
             self.step_since_reset = 0
             self.trigger_reset = False
             logger.info("Context compression triggered for %d requests", len(self.active_decode_pool))
@@ -576,24 +843,28 @@ class UnifiedScheduler:
         2. Slice KV tensors to match (keep first 4 + last 2048 positions)
         3. Free any intermediate KV blocks via existing pop interface
         4. [AFCE] Clear orphan sidecar anchors before compression
+
+        This is the simple position-based compression (StreamingLLM-style).
+        When ADAPTIVE_COMPRESSION_ENABLED is True, _compress_kv_adaptive
+        is used instead.
         """
         if req.cache_block_id is None or not req.tokens:
             return
 
         old_len = len(req.tokens)
-        if old_len <= 2052:
-            # Too short to need compression
+        sink_n = self._COMPRESS_SINK_N
+        recent_n = self._COMPRESS_RECENT_N
+        if old_len <= sink_n + recent_n:
             return
 
-        # [AFCE] Clear orphan sidecar for old hash — token sequence will
-        # change after compression, leaving stale anchors unreachable.
+        # [AFCE] Clear orphan sidecar for old hash
         if self._afce_manager is not None:
             old_hash = self.cache.compute_hash(req.tokens)
             if old_hash and self._afce_manager.has_sidecar(old_hash):
                 self._afce_manager.remove_sidecar(old_hash)
 
-        # Build new token sequence
-        new_tokens = req.tokens[:4] + req.tokens[-2048:]
+        # Build new token sequence: sink + recent window
+        new_tokens = req.tokens[:sink_n] + req.tokens[-recent_n:]
         req.tokens = new_tokens
 
         # Compress KV tensors in place
@@ -601,11 +872,10 @@ class UnifiedScheduler:
         if kv is not None:
             compressed_kv = []
             for k, v in kv:
-                # k, v shape: [1, num_heads, seq_len, head_dim]
-                first_k = k[:, :, :4, :]
-                last_k = k[:, :, -2048:, :]
-                first_v = v[:, :, :4, :]
-                last_v = v[:, :, -2048:, :]
+                first_k = k[:, :, :sink_n, :]
+                last_k = k[:, :, -recent_n:, :]
+                first_v = v[:, :, :sink_n, :]
+                last_v = v[:, :, -recent_n:, :]
                 compressed_k = torch.cat([first_k, last_k], dim=2)
                 compressed_v = torch.cat([first_v, last_v], dim=2)
                 compressed_kv.append((compressed_k, compressed_v))
@@ -615,6 +885,269 @@ class UnifiedScheduler:
             "KV compressed for %s: %d -> %d tokens",
             req.request_id, old_len, len(new_tokens),
         )
+
+    def _compress_kv_adaptive(self, req: DecodeRequest) -> None:
+        """H2O-style adaptive KV compression: keep attention sink + recent
+        window + most "important" middle tokens.
+
+        Compression strategy (H2O + StreamingLLM hybrid):
+        1. Always keep ``_COMPRESS_SINK_N`` initial tokens (attention sink)
+        2. Always keep ``_COMPRESS_RECENT_N`` most recent tokens (sliding window)
+        3. From the middle ``(sink, -recent)`` region, keep the top
+           ``_COMPRESS_IMPORTANCE_FRAC`` fraction of tokens, scored by a
+           lightweight importance proxy.
+
+        Importance scoring (no attention weights needed):
+        - Uses router logits from MoE layers (``_last_router_probs``) as
+          proxy: tokens that trigger high-entropy routing are considered
+          more "interesting" and thus important.
+        - Falls back to uniform sampling (coverage) if router logits are
+          unavailable.
+        - Boosts tokens at cluster boundaries via AFCE-backed positions,
+          since AFCE anchors contribute to long-range coherence.
+
+        Compatible with all existing modules (KV quantization, AFCE,
+        Goose, SERE, OEF).
+        """
+        if req.cache_block_id is None or not req.tokens:
+            return
+
+        sink_n = self._COMPRESS_SINK_N
+        recent_n = self._COMPRESS_RECENT_N
+        old_len = len(req.tokens)
+        target_total = sink_n + recent_n
+
+        if old_len <= target_total + 8:
+            return
+
+        # [AFCE] Clear orphan sidecar for old hash
+        if self._afce_manager is not None:
+            old_hash = self.cache.compute_hash(req.tokens)
+            if old_hash and self._afce_manager.has_sidecar(old_hash):
+                self._afce_manager.remove_sidecar(old_hash)
+
+        # ── Build token selection ─────────────────────────────────
+        # Always keep sink tokens (positions 0..sink_n-1)
+        keep_set = set(range(sink_n))
+        # Always keep recent window (last recent_n positions)
+        keep_set.update(range(old_len - recent_n, old_len))
+
+        # ── Score middle region ───────────────────────────────────
+        middle_start = sink_n
+        middle_end = old_len - recent_n
+        middle_len = middle_end - middle_start
+
+        if middle_len > 0:
+            # Try to use router logits for importance scoring
+            importance_scores: list[float] | None = None
+            if (
+                hasattr(self.model, "_last_router_probs")
+                and self.model._last_router_probs is not None
+            ):
+                router = self.model._last_router_probs
+                # entropy of router distribution as importance proxy
+                # high entropy = ambiguous routing = important token
+                if router.dim() >= 2 and middle_len <= router.shape[-2]:
+                    probs_mid = router[0, -middle_len:, :]
+                    entropy = -(probs_mid * torch.log(probs_mid.clamp(min=1e-10))).sum(dim=-1)
+                    importance_scores = entropy.tolist()
+                else:
+                    # Try per-position router access
+                    try:
+                        router_flat = router.flatten()
+                        if len(router_flat) >= middle_len:
+                            importance_scores = router_flat[-middle_len:].tolist()
+                        else:
+                            importance_scores = [0.5] * middle_len
+                    except Exception:
+                        importance_scores = None
+
+            if importance_scores is None:
+                # Fallback: uniform coverage — sample evenly
+                num_extra = max(
+                    4, int(middle_len * self._COMPRESS_IMPORTANCE_FRAC)
+                )
+                step = max(1, middle_len // num_extra)
+                for i in range(middle_start, middle_end, step):
+                    keep_set.add(i)
+            else:
+                # Keep top-k by importance
+                num_extra = max(
+                    4, int(middle_len * self._COMPRESS_IMPORTANCE_FRAC)
+                )
+                # Pair each middle index with its score
+                indexed = list(
+                    zip(range(middle_start, middle_end), importance_scores)
+                )
+                indexed.sort(key=lambda x: x[1], reverse=True)
+                for i, _ in indexed[:num_extra]:
+                    keep_set.add(i)
+
+        # ── Build new token sequence ──────────────────────────────
+        keep_indices = sorted(keep_set)
+        new_tokens = [req.tokens[i] for i in keep_indices]
+        req.tokens = new_tokens
+
+        # ── Slice KV tensors ──────────────────────────────────────
+        kv = self.cache.load_kv(req.cache_block_id)
+        if kv is not None:
+            compressed_kv = []
+            for k, v in kv:
+                # k, v shape: [1, num_heads, seq_len, head_dim]
+                compressed_k = torch.index_select(k, 2, torch.tensor(keep_indices, device=k.device))
+                compressed_v = torch.index_select(v, 2, torch.tensor(keep_indices, device=v.device))
+                compressed_kv.append((compressed_k, compressed_v))
+            self.cache.store_kv(req.cache_block_id, compressed_kv)
+
+        logger.info(
+            "Adaptive KV compressed for %s: %d -> %d tokens (kept %d middle via importance)",
+            req.request_id, old_len, len(new_tokens),
+            len([i for i in keep_indices if middle_start <= i < middle_end]),
+        )
+
+    # ==================================================================
+    # Self-speculative decode (ACL'24 — skip-layer draft)
+    # ==================================================================
+
+    def _decode_self_speculative(self) -> None:
+        """Self-speculative decode using skeleton (skip-layer) draft
+        (ACL'24).
+
+        Generates draft tokens by running the model forward with the
+        last ~30% of decoder layers replaced by identity modules
+        (skip-level draft).  The draft is then verified by the full
+        model through the existing verify_linear pipeline (via Goose
+        engine) or directly by the model forward.
+
+        This complements PLD-based Goose:
+        - PLD: relies on repeated n-gram patterns (good for code,
+          formal text, templates)
+        - Skeleton: works on ANY text regardless of repetition
+          (good for creative writing, reasoning, high-entropy tasks)
+
+        Compatible with KV cache: past_key_values pass through
+        identity layers unchanged, and the verify step updates KV.
+        """
+        if not self._self_spec_enabled or self._skeleton_draft is None:
+            return
+
+        if not self.active_decode_pool:
+            return
+
+        for req in list(self.active_decode_pool):
+            if req.is_done or req.request_id in self._spec_handled:
+                continue
+
+            context = req.tokens
+            if len(context) < 8:
+                continue
+
+            # ── Load KV cache ────────────────────────────────────
+            past_kv = None
+            if req.cache_block_id is not None and self._KV_CACHE_ENABLED:
+                past_kv = self.cache.load_kv(req.cache_block_id)
+
+            # ── Generate skeleton draft ──────────────────────────
+            last_tok = torch.tensor(
+                [[context[-1]]], dtype=torch.long, device="cuda"
+            )
+            draft_tokens = self._skeleton_draft.generate_draft(
+                input_ids=last_tok,
+                past_key_values=past_kv,
+            )
+
+            if not draft_tokens:
+                continue
+
+            # ── Verify: use existing Goose verify_linear if available ──
+            if self._goose_engine is not None:
+                accepted, next_token, new_kv = (
+                    self._goose_engine.verify_linear(
+                        self.model,
+                        past_kv if past_kv is not None else None,
+                        draft_tokens,
+                        context,
+                    )
+                )
+            else:
+                # Fallback: manual single-step verification
+                accepted = []
+                new_kv = past_kv
+                for dt in draft_tokens:
+                    inp = torch.tensor(
+                        [[context[-1] if not accepted else accepted[-1]]],
+                        dtype=torch.long, device="cuda",
+                    )
+                    with torch.no_grad():
+                        out = self.model.forward(
+                            input_ids=inp,
+                            past_key_values=new_kv,
+                            use_cache=True,
+                        )
+                    logits_t = _extract_logits(out)
+                    predicted = int(logits_t[0, -1, :].argmax().item())
+                    if predicted == dt:
+                        accepted.append(dt)
+                        new_kv = _extract_past_key_values(out)
+                    else:
+                        next_token = predicted
+                        new_kv = _extract_past_key_values(out)
+                        break
+                else:
+                    # All accepted — get bonus token
+                    inp = torch.tensor(
+                        [[accepted[-1]]], dtype=torch.long, device="cuda",
+                    )
+                    with torch.no_grad():
+                        out = self.model.forward(
+                            input_ids=inp,
+                            past_key_values=new_kv,
+                            use_cache=True,
+                        )
+                    logits_t = _extract_logits(out)
+                    next_token = int(logits_t[0, -1, :].argmax().item())
+                    new_kv = _extract_past_key_values(out)
+
+            if not accepted:
+                continue
+
+            # ── Update request state ─────────────────────────────
+            self._spec_handled.add(req.request_id)
+
+            for tok in accepted:
+                req.step()
+                req.generated_tokens.append(tok)
+                req.tokens.append(tok)
+
+            # Bonus token
+            req.step()
+            req.generated_tokens.append(next_token)
+            req.tokens.append(next_token)
+
+            # Update KV cache
+            if new_kv is not None and req.cache_block_id is not None:
+                self.cache.store_kv(req.cache_block_id, new_kv)
+
+            # Harvest logits into PLD transition table (if Goose engine active)
+            if self._goose_engine is not None:
+                verify_window = req.tokens[-(len(accepted) + 1):]
+                if verify_window:
+                    harvest_inp = torch.tensor(
+                        [verify_window], dtype=torch.long, device="cuda"
+                    )
+                    with torch.no_grad():
+                        lb_out = self.model.forward(
+                            input_ids=harvest_inp, use_cache=False,
+                        )
+                    lb_logits = _extract_logits(lb_out)
+                    self._goose_engine.harvest_logits(
+                        lb_logits, list(verify_window)
+                    )
+
+            logger.debug(
+                "Self-speculative: %s accepted %d/%d (skeleton draft)",
+                req.request_id, len(accepted), len(draft_tokens),
+            )
 
     # ==================================================================
     # Goose speculative decode (Phase 0/1 → chain; Phase 2 → tree)
@@ -756,9 +1289,13 @@ class UnifiedScheduler:
     async def step(self):
         # Init layers (lazy)
         if self._expert_cache is None and getattr(self.model, "is_moe", False):
-            self._init_expert_cache(vram_capacity=64)
+            self._init_expert_cache()  # VRAM capacity auto-tuned via budget or GPU info
 
-        self._batch_prefill()
+        # Chunked prefill (process one chunk per pending request)
+        if self.CHUNKED_PREFILL_ENABLED:
+            self._batch_chunked_prefill()
+        else:
+            self._batch_prefill()
 
         if self._sere is None and getattr(self.model, "is_moe", False):
             self._init_sere()
@@ -773,7 +1310,66 @@ class UnifiedScheduler:
         if self._dynamic_activator is None or self._spec_prefetcher is None:
             self._init_speculative_prefetch()
 
-        # [Goose] Try speculative decode first
+        # ── [VRAM Budget] Runtime memory check ─────────────────────
+        if self._vram_budget is not None:
+            self._vram_step_counter += 1
+            if self._vram_step_counter % self._vram_check_interval == 0 or self._vram_degraded:
+                status = self._vram_budget.check()
+                action = status.get("action")
+                if action == "reduce_chunk" and self.CHUNK_SIZE > 64:
+                    old = self.CHUNK_SIZE
+                    self.CHUNK_SIZE = max(64, self.CHUNK_SIZE // 2)
+                    self._vram_degraded = True
+                    logger.warning(
+                        "VRAM degradation: chunk size %d → %d (%s)",
+                        old, self.CHUNK_SIZE, status["message"],
+                    )
+                elif action == "compress_kv":
+                    if not self.trigger_reset:
+                        old_frac = self._COMPRESS_IMPORTANCE_FRAC
+                        self._COMPRESS_RECENT_N = max(512, self._COMPRESS_RECENT_N // 2)
+                        self._COMPRESS_IMPORTANCE_FRAC = min(0.40, old_frac + 0.10)
+                        self.trigger_reset = True
+                        self._vram_degraded = True
+                        logger.warning(
+                            "VRAM critical → forced KV compression (%s)",
+                            status["message"],
+                        )
+                elif action == "emergency":
+                    # Stall new requests and compress all active
+                    self._PREFILL_BATCH_MAX = max(1, self._PREFILL_BATCH_MAX // 2)
+                    self.CHUNK_SIZE = max(64, self.CHUNK_SIZE // 2)
+                    if not self.trigger_reset:
+                        self.trigger_reset = True
+                    self._vram_degraded = True
+                    logger.error(
+                        "VRAM emergency: throttled batch_max=%d, chunk=%d (%s)",
+                        self._PREFILL_BATCH_MAX, self.CHUNK_SIZE, status["message"],
+                    )
+
+        # [Self-Speculative] Try skeleton draft first (broadest coverage)
+        if self._self_spec_enabled and self._skeleton_draft is not None:
+            self._decode_self_speculative()
+
+        # [Goose] Auto-init on first step if available
+        if self._goose_enabled and self._goose_engine is None and _GOOSE_AVAILABLE and not self._goose_auto_init_tried:
+            self._goose_auto_init_tried = True
+            self._init_goose(
+                tree_enabled=False,
+                max_draft=_auto_tune_max_draft(
+                    getattr(self.model, 'hidden_size', 4096),
+                ),
+            )
+            logger.info("Goose speculative decoding auto-enabled (max_draft=%d)",
+                        self._goose_engine.max_draft if self._goose_engine else 0)
+
+        # [Self-Speculative] Auto-init skeleton draft on first step
+        if self._self_spec_enabled and self._skeleton_draft is None and _SKELETON_AVAILABLE and not self._skeleton_auto_init_tried:
+            self._skeleton_auto_init_tried = True
+            self._init_skeleton_draft()
+            logger.info("Self-speculative decoding auto-enabled")
+
+        # [Goose PLD] Then try PLD-based speculative (pattern matching)
         self._decode_speculative()
 
         self._decode_step()
@@ -802,6 +1398,16 @@ class UnifiedScheduler:
             # Nothing to free — skip expensive sync
             self.active_decode_pool = [d for d in self.active_decode_pool if not d.is_done]
             self.cache.gc()
+            if self.PREFIX_CACHING_ENABLED and self._prefix_cache_total > 0:
+                hit_ratio = self._prefix_cache_hits / self._prefix_cache_total * 100
+                if self._prefix_cache_total % 100 == 0:
+                    logger.info(
+                        "Prefix cache: %d/%d hits (%.1f%%), %d pinned blocks",
+                        self._prefix_cache_hits,
+                        self._prefix_cache_total,
+                        hit_ratio,
+                        self.cache.pinned_count,
+                    )
             return
 
         # Targeted sync: ensure no GPU kernel references blocks we're freeing

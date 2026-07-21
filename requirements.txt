@@ -1,14 +1,14 @@
 # === Core engine dependencies ===
-torch==2.6.0+cu124
-transformers==4.51.3
+torch==2.13.0
+transformers==5.14.1
 
 # === GGUF model loader (pure Python, no llama-cpp-python) ===
 # numpy is required by PyTorch and tests
-numpy>=1.24
+numpy>=2.0
 
 # === Development & code review ===
-ruff>=0.15.0
-pytest>=9.0.0
+ruff>=0.15.22
+pytest>=9.1.1
 
 # === Optional: HTTP service ===
 # fastapi

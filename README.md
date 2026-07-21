@@ -24,15 +24,19 @@
 |------|------|------|
 | 🔥 **FlashAttention 核** | `attention_kernel.py` | 基于 PyTorch SDPA + `torch.compile` 的优化注意力 |
 | 📦 **混合缓存** | `cache_manager.py` | PagedAttention 物理块 + RadixAttention 哈希索引 |
+| 🧮 **显存预算** | `vram_budget.py` | 集中式显存预算管理器，启动评估 + 运行时 OOM 防护 |
 | ⏱ **统一调度器** | `scheduler.py` | Chunked Prefill + Decode 双 CUDA 流调度 |
 | 🚀 **入口** | `main.py` | 全局配置、模型注入、事件循环 |
 | 📖 **GGUF 加载** | `model_loader/` | 纯 Python GGUF v3 解析器 + PyTorch 原生量化适配 |
-| 🧠 **专家缓存** | `expert_cache.py` | 层次化 LRU-Frequency-Reuse 专家权重卸载/加载 |
-| 🧩 **超长上下文** | `long_context/` | SelfExtend / ReAttention / YaRN 训练无关上下文扩展（默认开启） |
-| ⚡ **SERE** | `sere.py` | 动态专家跳过，top-k 后重路由 |
-| 🔮 **推测解码** | `ngram_speculation.py` | CPU Trie N-Gram 推测解码 |
+| 🧩 **超长上下文** | `long_context/` | SelfExtend / ReAttention / YaRN 训练无关上下文扩展（自动开启） |
+| 🔮 **推测解码** | `ngram_speculation.py` + `goose_core` + `scheduler.py` | CPU Trie N-Gram + Goose PLD 线性链 + Self-Spec 骨架推测（全部自动开启） |
+| ⚡ **SERE** | `sere.py` | 动态专家跳过，top-k 后重路由（根据模型自动调参） |
+| 🧠 **专家缓存** | `expert_cache.py` | 层次化 LFRU 专家权重卸载/加载（VRAM 容量自动计算） |
+| 🧬 **OEF** | `oef.py` | 机会性熵冻结，旁路监控路由置信度，自动建议跳过确定性专家 |
+| 🧠 **AFCE** | `afce.py` | 锚点前向缓存扩展，32-token 簇锚点旁路，修复长上下文语义遗忘 |
+| 🛠️ **工具下沉** | `tool_sink.py` | 模型内生工具调用框架——状态机扫描 `[[tool(...)]]` 标记、7 项内置工具、3 轮循环编排、零第三方依赖 |
 
-> **关键词**：MoE推理 | 大模型加速 | 混合KV缓存 | 专家卸载 | FlashAttention | 推测解码 | 超长上下文 | 双流管线 | PyTorch | GGUF | 纯Python
+> **关键词**：MoE推理 | 大模型加速 | 混合KV缓存 | 专家卸载 | FlashAttention | 推测解码 | 超长上下文 | 双流管线 | 显存预算 | PyTorch | GGUF | 纯Python | 工具下沉
 
 ---
 
@@ -48,10 +52,18 @@
 | 🎯 **Float32 matmul precision** | `torch.set_float32_matmul_precision("high")` | 自动 ✅ |
 | 📦 **torch.compile 静态图编译** | 自动尝试 reduce-overhead → default 降级链，失败则跳过 | 自动 ✅ |
 | 🧊 **KV Cache 非对称量化** | Key→INT8 + Value→INT4，首尾 8 token 保留 FP16，门控透明 | 自动 ✅ |
-| 📏 **动态块大小建议** | 根据 hidden_size 自动最优推荐 | 自动 ✅ |
+| ⏱ **自适应 KV 压缩** | 根据模型 max_seq_len 自动调优 sink/window/importance 参数 | 自动 ✅ |
+| 🧠 **SERE 动态专家跳过** | 根据 num_experts/top_k 自动调优 skip_threshold 和 min_experts | 自动 ✅ |
+| 🏗 **层次化专家缓存** | 根据 GPU 可用显存自动计算 VRAM 容量 | 自动 ✅ |
+| 🔄 **Self-Spec 骨架推测** | `SkeletonDraftGenerator` 可用时自动开启 | 自动 ✅ |
+| 🔬 **OEF 熵冻结** | `oef` 模块可用时自动开启并监控路由置信度 | 自动 ✅ |
+| 🧩 **AFCE 锚点缓存** | `afce` 模块可用时自动开启 | 自动 ✅ |
+| 🚀 **N-Gram 推测解码** | CPU Trie 自动构建并推测 | 自动 ✅ |
+| 📊 **动态专家激活** | 根据 logits 置信度自动调整每 token 激活专家数 | 自动 ✅ |
+| 📏 **动态块大小** | 根据 hidden_size 和可用显存自动选择最优块大小 | 自动 ✅ |
 | 🔗 **超长上下文 SelfExtend** | 默认开启（4 行位置编码逻辑，无需任何配置） | 自动 ✅ |
 | ⏱ **双 CUDA 流管线** | Prefill 流 + Decode 流自动配合 | 自动 ✅ |
-| 🔎 **Goose 推测解码** | `--speculative` 一键开启，无需手工调优 | `--speculative` |
+| 🔎 **Goose 推测解码** | `goose_core` 可用时自动开启，根据 hidden_size 自动调整 draft 数 | 自动 ✅ |
 
 > **不需要：** 修改任何配置文件、设置任何环境变量、提供任何调优参数。
 > 也不需要在不同模型间切换不同配置——所有优化对 HF / GGUF / 任意尺寸模型一视同仁。
@@ -69,6 +81,100 @@
 - **原生量化加载**：Q4_0/Q8_0 纯 PyTorch bitwise 反量化，零 C 扩展
 - **KV Cache 非对称量化**：Key→INT8 + **Value→INT4 位运算打包**，显存降至 FP16 的 37.5%（首尾各 8 个 token 保留 FP16 精度）
 - **LRU 前缀匹配缓存**：`match_prefix` 增加 hash-based LRU（max 256 条目），重复前缀 **O(1)** 命中
+
+---
+
+## 🧮 集中式显存预算管理器 (`vram_budget.py`)
+
+**启动时统一评估，运行时实时 OOM 防护。** 把所有吃显存的子系统拉到一张表上算总账，不再各自为政。
+
+### 启动阶段：统一预算分配
+
+```
+当前可用显存
+     │
+     ├── 模型权重（估算）
+     │
+     └── 剩余显存
+              ├── KV Cache        ← 45%
+              ├── 专家缓存 (VRAM)  ← 25%
+              ├── 激活/缓冲区      ← 15%
+              └── 安全余量          ← 15% （永不触碰）
+```
+
+### 运行时：三级水位告警
+
+| 水位线 | 剩余比例 | 自动措施 |
+|--------|----------|----------|
+| ✅ 健康 | > 15% | 无操作 |
+| ⚠️ 偏低 | 8%–15% | 预填充块大小减半 |
+| 🔴 紧张 | 4%–8%  | 强制 KV 压缩 + 增大压缩窗口 |
+| 🆘 告急 | < 4%   | 批处理上限减半 + 块减半 + 强制压缩 |
+
+### 零基础日志
+
+```python
+from vram_budget import VRAMBudget
+
+# 启动时：自动打印完整报告
+budget = VRAMBudget(hidden_size=4096, num_layers=32, num_experts=8, is_moe=True)
+budget.log_status()     # ← 一行命令，输出完整显存预算报告
+
+# 运行时：一行查当前显存
+import logging
+logging.info(VRAMBudget.log_runtime())  # → "VRAM: 6.2 GiB / 23.9 GiB 可用 (25.9%)"
+```
+
+---
+
+## 📋 统一日志系统 (`moe_logger.py`)
+
+**启动即得清晰日志，零基础用户无需任何配置。** 所有模块的日志经过统一管理，只展示关键里程碑，自动抑制内部模块的细碎信息。
+
+### 三种日志级别
+
+| 使用方式 | 显示内容 | 适用场景 |
+|----------|----------|----------|
+| 默认启动 | ✅ 启动徽标 · 优化组件 · 模型摘要 · VRAM 报告 · 引擎就绪 | 零基础用户 |
+| `-v` / `--verbose` | + 模块 INFO 日志 · 缓存分配 · 解码细节 | 调试优化时 |
+| `MOE_LOG_LEVEL=debug` | + 全部 DEBUG · CUDA Graph 编译 · 注意力算子 | 开发者调试 |
+
+### 启动时看到的内容
+
+```
+  🚀  MoeOwner — MoE 异构推理引擎
+  Python: 3.12  |  PyTorch: 2.6.0
+  GPU:    NVIDIA A100  (72GiB/80GiB 可用)
+
+  🔧 优化组件状态
+  ─────────────────────────────────────────
+    FlashAttention SDPA      ✅  强制 flash 版
+    KV Cache (混合)          ✅  Paged + Radix + 非对称量化
+    Goose 推测解码           ✅  已开启
+    SelfExtend 超长上下文    ✅  默认开启
+    ...
+  ─────────────────────────────────────────
+
+  🖥️  MoeOwner 显存预算报告  ← VRAMBudget
+  ...
+
+  📦 模型摘要
+  ─────────────────────────────────────────
+    路径/名称:   Qwen/Qwen2.5-1.5B-Instruct
+    架构:        Dense | 28 层 | 2048 维
+  ─────────────────────────────────────────
+
+  ✅  MoeOwner 推理引擎就绪
+  🌐  API: http://localhost:8000/v1/completions
+```
+
+### 运行时显存快照
+
+```bash
+# 一行查当前显存（适合嵌入循环日志）
+from moe_logger import log_runtime_vram
+log_runtime_vram()  # → 输出: 📊 6.2GiB/23.9GiB 可用 (26%)
+```
 
 ---
 
@@ -97,7 +203,38 @@
 - 每步推测 3–5 个候选 token，批量验证
 - 推测命中率 40–70%（取决于模型与任务）
 
-### 4. 调度器三阶段管线
+### 4. 工具调用编排 (`tool_sink.py`)
+
+**自包含的工具下沉框架**，允许推理引擎内生地调用内置工具并基于结果重新推理，无需外部编排层。
+
+| 组件 | 功能 |
+|------|------|
+| `ToolContext` | 请求级生命周期容器：临时目录 + 内存键值对 + 消息历史队列 + `threading.RLock` 并发安全 + 销毁时进程/内存/磁盘同步清理 |
+| `ToolScanner` | 逐字符状态机，检测 `[[tool_name(key=value, ...)]]` 标记（4 状态：TEXT→LEFT_BRACKET→LEFT_DOUBLE→SAW_CLOSE_BRACKET） |
+| `ToolOrchestrator` | 编排引擎：提交推理请求 → 扫描工具标记 → 执行工具 → 重构历史（user + assistant含标记 + tool结果 + 空assistant）→ 重新推理（最多 3 轮）→ 最终 format_fixer 清洗 |
+
+**7 项硬编码内置工具：**
+
+| 工具 | 签名 | 实现 |
+|------|------|------|
+| `memo_set` | `(key, value) → str` | 工作区内存字典存储 |
+| `memo_get` | `(key) → str` | 读取工作区内存 |
+| `sci_calc` | `(expression) → str` | `math`+`cmath` 全量导出、AST 形状校验(≤2D/100×100)、线程超时(1s)、nan/inf→null |
+| `sys_env` | `() → dict` | `os.uname`/`platform` 系统信息、CPU/内存、Windows 兼容回退 |
+| `list_ports` | `() → list` | `/proc/net/tcp`→`ss`→`netstat` 多级降级、异常→空列表 |
+| `ping_target` | `(host, port, timeout) → str(JSON)` | TCP 套接字探测、1 次重试、返回可达性+延迟 |
+| `format_fixer` | `(raw) → str` | JSON 清洗（尾随逗号/引号归一/逐字符回退截断）——输出钩子双角色 |
+| `sandbox_run` | `(code) → str` | `subprocess` 沙箱、白名单builtins(仅15个)、5s超时SIGKILL、64KB截断、Windows兼容 |
+| `fetch_url` | `(url, max_chars) → str` | 协议强校验(http/https)、固定UA、Content-Type过滤、`html.parser` 文本提取、三重超时(DNS 5s+连接 5s+读取 10s) |
+
+**约束：**
+- 参数解析四阶段降级：`literal_eval` → `json.loads` → 自定义`key=value`解析器 → 位置回退
+- 单请求硬上限 3 轮（含同一工具重复调用），超限返回 `LOOP_LIMIT_EXCEEDED`
+- 单条 Tool 消息容量硬上限 100KB
+- 输出最终过 `format_fixer()` 后钩子，修复失败截断至最后一个合法 JSON + `[FORMAT_TRUNCATED]`
+- 全零第三方依赖（stdlib 仅限）
+
+### 5. 调度器三阶段管线
 
 ```
 输入 → [调度层] → [缓存层] → [推理层] → 输出
@@ -118,8 +255,8 @@
 
 ```bash
 # 安装
-pip install torch==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
-pip install transformers==4.51.3
+pip install torch==2.13.0
+pip install transformers==5.14.1
 ```
 
 > **注**：`cache_manager.py` 无需 GPU 即可运行单元测试（无 CUDA 时回退至 10000 块）
@@ -261,7 +398,7 @@ python main.py --model Qwen/Qwen2.5-32B --disable-long-context
 
 > 上下文短于 2048 tokens 时自动跳过（`short_context_threshold`），不影响短文本性能。
 
-集成在 `long_context/` 模块中，与所有其他优化（KV cache 量化、Goose、AFCE、OEF、SERE）完全兼容。
+集成在 `long_context/` 模块中，与所有其他优化（KV cache 量化、Goose 推测解码、Self-Spec 骨架推测、AFCE、OEF、SERE）完全兼容。
 
 ---
 
@@ -359,10 +496,18 @@ A production-oriented inference engine purpose-built for **Mixture-of-Experts** 
 | 🎯 **Float32 matmul precision** | `torch.set_float32_matmul_precision("high")` | Automatic ✅ |
 | 📦 **torch.compile** | Auto-tries reduce-overhead → default fallback chain; gracefully skips on failure | Automatic ✅ |
 | 🧊 **KV Cache asymmetric quantization** | Key→INT8 + Value→INT4 packed; head/tail 8-token FP16 protection; transparent gate | Automatic ✅ |
-| 📏 **Dynamic block size** | Auto-recommends based on hidden_size | Automatic ✅ |
+| 📏 **Dynamic block size** | Auto-optimized based on hidden_size and available GPU memory | Automatic ✅ |
+| ⏱ **Adaptive KV compression** | Auto-tuned sink/window/importance params from model max_seq_len | Automatic ✅ |
+| 🧠 **SERE dynamic expert skip** | Auto-tuned skip_threshold/min_experts from num_experts/top_k | Automatic ✅ |
+| 🏗 **Hierarchical expert cache** | VRAM capacity auto-calculated from available GPU memory | Automatic ✅ |
+| 🔄 **Self-speculative skeleton** | Auto-enabled when `SkeletonDraftGenerator` is available | Automatic ✅ |
+| 🔬 **OEF entropy freeze** | Auto-enabled when `oef` module is available; monitors router confidence | Automatic ✅ |
+| 🧩 **AFCE anchor cache** | Auto-enabled when `afce` module is available | Automatic ✅ |
+| 🚀 **N-Gram speculation** | CPU Trie auto-built and queried | Automatic ✅ |
+| 📊 **Dynamic expert activation** | Per-token k auto-adjusted by logit confidence | Automatic ✅ |
 | 🔗 **Long context SelfExtend** | Default-on (4-line position-id injection, zero config needed) | Automatic ✅ |
 | ⏱ **Dual CUDA stream pipeline** | Prefill + decode streams auto-coordinated | Automatic ✅ |
-| 🔎 **Goose speculative decoding** | One-flag enable (`--speculative`), no manual tuning needed | `--speculative` |
+| 🔎 **Goose speculative decoding** | Auto-enabled when `goose_core` is available; draft count auto-tuned by model size | Automatic ✅ |
 
 > **No need to:** edit config files, set environment variables, provide tuning parameters, or switch settings between different models. All optimizations work uniformly for HF models, GGUF models, and any model size.
 
@@ -396,20 +541,21 @@ A production-oriented inference engine purpose-built for **Mixture-of-Experts** 
 
 ```bash
 # Install dependencies
-pip install torch==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
-pip install transformers==4.51.3
+pip install torch==2.13.0
+pip install transformers==5.14.1
 
 # Run tests
 python3 -m pytest tests/ -v
 
-# Start inference engine with HuggingFace model (SelfExtend auto-enabled)
+# Start inference engine with HuggingFace model (all optimizations auto-enabled)
 python main.py --model Qwen/Qwen2.5-1.5B-Instruct --api-port 8000
 
-# Or with a GGUF model (SelfExtend auto-enabled)
-python main.py --gguf /path/to/model.Q4_0.gguf --block-size 32 --verbose
+# Or with a GGUF model (all optimizations auto-enabled)
+python main.py --gguf /path/to/model.Q4_0.gguf --verbose
 
-# Disable long context
+# Disable long context or speculation
 python main.py --model Qwen/Qwen2.5-1.5B-Instruct --disable-long-context
+python main.py --model Qwen/Qwen2.5-1.5B-Instruct --no-speculative
 ```
 
 ## Architecture Overview

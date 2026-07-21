@@ -58,7 +58,7 @@ MENU = f"""
   {Style.GREEN}[4]{Style.RESET}  查看系统状态
   {Style.GREEN}[q]{Style.RESET}  退出
 
-{Style.DIM}  💡 超长上下文 (SelfExtend) 默认自动开启，无需任何参数{Style.RESET}
+{Style.DIM}  💡 所有优化已默认开启，全部自动调参，零配置{Style.RESET}
 """
 
 
@@ -209,8 +209,8 @@ def run_benchmark(model_path: str, mtype: str, prompt_len: int = 128,
         cmd += ["--gguf", model_path]
     else:
         cmd += ["--model", model_path]
-    if use_spec:
-        cmd += ["--speculative"]
+    if not use_spec:
+        cmd += ["--no-speculative"]
     if context_method and context_method != "none":
         cmd += ["--context-method", context_method]
 
@@ -245,6 +245,9 @@ def run_interactive(model_path: str, mtype: str, api_port: int = 8000,
             cmd += ["--reattn-top-k", "2048"]
         elif context_method == "yarn":
             cmd += ["--yarn-factor", "8"]
+
+    if not use_spec:
+        cmd += ["--no-speculative"]
 
     print(f"\n{Style.GREEN}{Style.BOLD}启动服务...{Style.RESET}")
     print(f"{Style.DIM}  • API: http://localhost:{api_port}/v1/completions")
@@ -292,9 +295,23 @@ def show_status():
     # Goose 推测
     try:
         import goose_core
-        print(f"  Goose:      可用 (Phase 0/1)")
+        print(f"  Goose:      可用 (Phase 0/1 + Self-Spec Skeleton)")
     except ImportError:
         print(f"{Style.YELLOW}  Goose:      不可用{Style.RESET}")
+
+    # AFCE
+    try:
+        import afce
+        print(f"  AFCE:       可用 _(锚点缓存)_")
+    except ImportError:
+        print(f"{Style.YELLOW}  AFCE:       不可用{Style.RESET}")
+
+    # OEF
+    try:
+        import oef
+        print(f"  OEF:        可用 _(熵冻结)_")
+    except ImportError:
+        print(f"{Style.YELLOW}  OEF:        不可用{Style.RESET}")
 
     # 发现的模型
     ggufs = find_gguf_models()
@@ -328,7 +345,7 @@ def main():
     # 非交互模式下：自动选择模型，自动运行
     if auto_mode or quick_mode or not sys.stdout.isatty():
         model_path, mtype = ask_model(args)
-        use_spec = "--speculative" in args or "-s" in args
+        use_spec = "--no-speculative" not in args  # 默认开启
         context_method = parse_context_method(args)
 
         if not quick_mode:

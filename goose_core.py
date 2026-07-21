@@ -1035,3 +1035,196 @@ class SpeculativeEngine:
         """Force-enable speculation (bypass warm-up)."""
         self._warmup_steps = self._warmup_threshold
         logger.info("SpeculativeEngine: force-enabled")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 6. SkeletonDraftGenerator — Self-Speculative Decoding
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class _IdentityLayer(torch.nn.Module):
+    """A no-op placeholder that passes hidden states through unchanged.
+
+    Used to skip specific decoder layers during draft generation.
+    The original module reference is saved for restoration.
+    """
+
+    __slots__ = ("_orig",)
+
+    def __init__(self, original_layer: torch.nn.Module) -> None:
+        super().__init__()
+        self._orig = original_layer
+
+    def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        # Bypass all computation — just pass through
+        return hidden_states
+
+    def original(self) -> torch.nn.Module:
+        return self._orig
+
+
+class SkeletonDraftGenerator:
+    """Generates draft tokens by skipping a subset of decoder layers.
+
+    Self-Speculative Decoding (ACL'24): runs the model with selected
+    layers skipped to obtain a cheaper "skeleton" model.  The output
+    from this skeleton is used as draft tokens, which are then verified
+    by the full model through the existing verification pipeline.
+
+    Strategy
+    --------
+    - Skips the **last ``skip_fraction`` of layers** (e.g. 30% of the
+      top layers), keeping the bottom layers which encode more
+      fundamental linguistic patterns.
+    - Uses a context manager so the model is restored after draft
+      generation — no permanent modification.
+    - Falls back gracefully: if the model structure doesn't have
+      identifiable decoder layers, returns no draft (the caller then
+      falls through to the normal decode path).
+
+    Compatibility
+    -------------
+    - Works with both HF Transformers and GGUF models
+    - Compatible with KV cache (past_key_values pass through identity
+      layers unchanged)
+    - No model weight modification — purely inference-time layer skipping
+    - Compatible with Expert Cache: skipped layers simply don't access
+      their experts, reducing cache pressure
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        skip_fraction: float = 0.30,
+        max_draft: int = 5,
+    ):
+        self.model = model
+        self.skip_fraction = max(0.1, min(0.5, skip_fraction))
+        self.max_draft = max_draft
+
+        self._layers: list | None = None
+        self._num_layers: int = 0
+        self._skip_indices: set[int] = set()
+        self._originals: dict[int, torch.nn.Module] = {}
+
+        self._resolve_layers()
+
+        if self._num_layers:
+            logger.info(
+                "SkeletonDraftGenerator: %d layers, skip_fraction=%.2f -> "
+                "skipping %d layers (indices %s)",
+                self._num_layers, self.skip_fraction,
+                len(self._skip_indices),
+                sorted(self._skip_indices),
+            )
+
+    # ------------------------------------------------------------------
+    # Layer resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_layers(self) -> None:
+        """Locate decoder layers in the model and compute skip indices."""
+        layers = None
+        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+            layers = self.model.model.layers
+        elif hasattr(self.model, "layers"):
+            layers = self.model.layers
+        elif hasattr(self.model, "decoder") and hasattr(self.model.decoder, "layers"):
+            layers = self.model.decoder.layers
+        elif hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
+            # GPT-2 / OPT style
+            layers = self.model.transformer.h
+
+        if layers is None:
+            logger.warning("SkeletonDraftGenerator: could not locate decoder layers")
+            return
+
+        self._layers = list(layers)
+        self._num_layers = len(self._layers)
+        num_skip = max(1, int(self._num_layers * self.skip_fraction))
+        # Skip the LAST num_skip layers (high-level semantic processing)
+        self._skip_indices = set(
+            range(self._num_layers - num_skip, self._num_layers)
+        )
+
+    # ------------------------------------------------------------------
+    # Context manager — temporarily replaces layers with identity
+    # ------------------------------------------------------------------
+
+    def __enter__(self):
+        if self._layers is None:
+            return self
+
+        self._originals.clear()
+        for idx in self._skip_indices:
+            if idx < len(self._layers):
+                orig = self._layers[idx]
+                self._originals[idx] = orig
+                self._layers[idx] = _IdentityLayer(orig)
+
+        return self
+
+    def __exit__(self, *args) -> None:
+        if self._layers is None:
+            return
+
+        for idx, orig in list(self._originals.items()):
+            if idx < len(self._layers):
+                self._layers[idx] = orig
+        self._originals.clear()
+
+    # ------------------------------------------------------------------
+    # Draft generation
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def generate_draft(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: list | None = None,
+    ) -> list[int]:
+        """Generate draft tokens using the skeleton (skip-layer) model.
+
+        Parameters
+        ----------
+        input_ids : torch.Tensor
+            Shape ``(1, 1)`` — the last token (decode step input).
+        past_key_values : list or None
+            KV cache from the full model forward.  Passed through
+            identity layers unchanged.
+
+        Returns
+        -------
+        list[int]
+            Up to ``max_draft`` draft tokens.  Empty list if skeleton
+            model is unavailable.
+        """
+        if self._layers is None or self._num_layers == 0:
+            return []
+
+        drafts: list[int] = []
+        current_ids = input_ids
+        current_kv = past_key_values
+
+        with self:
+            for _ in range(self.max_draft):
+                out = self.model.forward(
+                    input_ids=current_ids,
+                    past_key_values=current_kv,
+                    use_cache=True,
+                )
+                logits = SpeculativeEngine._extract_logits(out)
+                next_tok = int(logits[0, -1, :].argmax().item())
+                drafts.append(next_tok)
+
+                # Prepare for next iteration
+                current_ids = torch.tensor(
+                    [[next_tok]], dtype=torch.long, device=input_ids.device
+                )
+                current_kv = SpeculativeEngine._extract_new_kv(out)
+
+                # Early stopping if no KV (shouldn't happen, but safe)
+                if current_kv is None:
+                    break
+
+        return drafts

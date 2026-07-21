@@ -5,6 +5,7 @@ Provides:
   - Block: a single KV cache block descriptor.
   - HybridCache: manages block allocation, prefix matching via radix index,
     reference counting, garbage collection, and GPU-memory-aware sizing.
+  - Prefix cache: pinned block support for automatic prefix caching.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ class Block:
     for compact memory layout and fast integer iteration.
     """
 
-    __slots__ = ("block_id", "hash_chain", "kv_tensor", "ref_count")
+    __slots__ = ("block_id", "hash_chain", "kv_tensor", "ref_count", "pinned")
 
     def __init__(
         self,
@@ -34,14 +35,19 @@ class Block:
         token_ids: list[int],
         kv_tensor: object = None,
         ref_count: int = 1,
+        pinned: bool = False,
     ) -> None:
         self.block_id = block_id
         self.hash_chain: array = array("i", token_ids)
         self.kv_tensor = kv_tensor
         self.ref_count = ref_count
+        self.pinned = pinned
 
     def __repr__(self) -> str:
-        return f"Block(id={self.block_id}, chain_len={len(self.hash_chain)}, refs={self.ref_count})"
+        return (
+            f"Block(id={self.block_id}, chain_len={len(self.hash_chain)}, "
+            f"refs={self.ref_count}, pinned={self.pinned})"
+        )
 
 
 class HybridCache:
@@ -49,12 +55,13 @@ class HybridCache:
     A hybrid radix-tree / block-based KV cache.
 
     Features:
-      - Incremental SHA-256 token hashing.
+      - Incremental BLAKE2b token hashing.
       - GPU-memory-aware total_blocks calculation.
       - Free-block queue for O(1) allocation.
       - Radix index for longest-prefix matching with LRU cache.
       - Reference-count-based GC.
       - Hash-tree prefetch on leaf cache hit.
+      - Pinned block support for prefix caching (automatic LRU eviction).
 
     [Bug 2] Radix index uses ``dict[str, set[int]]`` so multiple blocks
     sharing the same prefix hash are all tracked — no 1-to-1 overwrite.
@@ -63,6 +70,8 @@ class HybridCache:
     _PREFETCH_FANOUT_MAX: int = 3
     _MEM_FRACTION: float = 0.50
     _PROTECTED_N: int = 8      # number of head/tail tokens kept FP16
+    _PINNED_MAX: int = 256     # max pinned prefix-cache blocks
+    _PINNED_EVICT_FRACTION: float = 0.20  # evict oldest 20% when full
 
     def __init__(
         self,
@@ -98,6 +107,9 @@ class HybridCache:
         self._match_cache_lru: list[tuple] = []
         self._match_cache_max = 256
 
+        # Prefix caching: ordered list of pinned block IDs (oldest first)
+        self._pinned_lru: list[int] = []
+
         self._prefetch_stream: object | None = None
 
         # BlockID → KV payload cache
@@ -109,10 +121,12 @@ class HybridCache:
         self._block_kv_cache: dict[int, dict] = {}
 
         logger.info(
-            "HybridCache initialized: block_size=%d, total_blocks=%d, mem_frac=%.2f",
+            "HybridCache initialized: block_size=%d, total_blocks=%d, "
+            "mem_frac=%.2f, pinned_max=%d",
             self.block_size,
             self.total_blocks,
             self._MEM_FRACTION,
+            self._PINNED_MAX,
         )
 
     # ------------------------------------------------------------------
@@ -139,7 +153,7 @@ class HybridCache:
         """Compute the cumulative radix hash for a token sequence.
 
         Used by AFCE to look up the corresponding AnchorSidecar.
-        This is a public alias for the internal hash chain logic.
+        Also used by prefix caching logic.
         """
         if not token_ids:
             return ""
@@ -174,11 +188,120 @@ class HybridCache:
         return hashlib.blake2b(token_bytes, digest_size=8).hexdigest()
 
     # ------------------------------------------------------------------
+    # Prefix caching: pin / unpin / evict
+    # ------------------------------------------------------------------
+
+    def pin_block(self, block_id: int) -> None:
+        """Pin a block so it is preserved for prefix cache reuse.
+
+        Pinned blocks are skipped during normal free_block and FIFO
+        eviction.  They are tracked in a separate LRU list and only
+        evicted when the pinned count exceeds ``_PINNED_MAX``.
+        """
+        block = self.allocated_blocks.get(block_id)
+        if block is None:
+            logger.warning("pin_block: block %d not found", block_id)
+            return
+        if not block.pinned:
+            block.pinned = True
+            self._pinned_lru.append(block_id)
+            logger.debug("Block %d pinned (total pinned: %d)", block_id, len(self._pinned_lru))
+
+    def unpin_block(self, block_id: int) -> None:
+        """Release a pin on a block.  Does NOT free it, just marks freeable."""
+        block = self.allocated_blocks.get(block_id)
+        if block is None:
+            return
+        block.pinned = False
+        with contextlib.suppress(ValueError):
+            self._pinned_lru.remove(block_id)
+        logger.debug("Block %d unpinned", block_id)
+
+    def pin_prefix_from_match(self, block_id: int) -> bool:
+        """After a successful prefix match, pin the matched block.
+
+        Returns True if the block was newly pinned (or already pinned).
+        Automatically evicts the oldest pinned block if pinned count
+        exceeds ``_PINNED_MAX``.
+
+        This is the high-level API the scheduler calls after a prefix
+        match succeeds.
+        """
+        block = self.allocated_blocks.get(block_id)
+        if block is None:
+            return False
+
+        # Already pinned — just touch LRU order
+        if block.pinned:
+            with contextlib.suppress(ValueError):
+                self._pinned_lru.remove(block_id)
+            self._pinned_lru.append(block_id)
+            return True
+
+        # Evict oldest pinned block if at capacity
+        if len(self._pinned_lru) >= self._PINNED_MAX:
+            self._evict_oldest_pinned()
+
+        self.pin_block(block_id)
+        return True
+
+    def _evict_oldest_pinned(self) -> int:
+        """Evict the 20% oldest pinned blocks, LRU-fashion.
+
+        Returns number of blocks evicted.
+        """
+        evict_count = max(1, int(len(self._pinned_lru) * self._PINNED_EVICT_FRACTION))
+        evicted = 0
+        for _ in range(evict_count):
+            if not self._pinned_lru:
+                break
+            oldest = self._pinned_lru.pop(0)
+            block = self.allocated_blocks.get(oldest)
+            if block and block.pinned:
+                block.pinned = False
+                self._free_block_forced(oldest)
+                evicted += 1
+        if evicted:
+            logger.debug("Evicted %d oldest pinned blocks", evicted)
+        return evicted
+
+    # ------------------------------------------------------------------
+    # Full prefix match: is this exact token sequence cached?
+    # ------------------------------------------------------------------
+
+    def has_prefix(self, token_ids: list[int]) -> int | None:
+        """Check if an exact token sequence is cached as a pinned block.
+
+        Returns block_id of the matching pinned block, or None.
+        This is the fast path for ``submit()``: exact match → skip prefill.
+        """
+        if not token_ids:
+            return None
+        cumulative_hash = self._hash_single_token(token_ids[0])
+        for t in token_ids[1:]:
+            cumulative_hash = self._incremental_hash(cumulative_hash, t)
+
+        candidates = self.radix_index.get(cumulative_hash, set())
+        for bid in candidates:
+            block = self.allocated_blocks.get(bid)
+            if block is not None and block.pinned:
+                return bid
+        return None
+
+    # ------------------------------------------------------------------
     # Allocation
     # ------------------------------------------------------------------
 
     def _free_block_forced(self, block_id: int) -> None:
-        """Force-free a block without ref_count check (FIFO eviction path)."""
+        """Force-free a block (FIFO eviction path).
+
+        Skips pinned blocks — they are managed separately by
+        ``_evict_oldest_pinned``.
+        """
+        block = self.allocated_blocks.get(block_id)
+        if block is not None and block.pinned:
+            return
+
         radix = self.radix_index
         block = self.allocated_blocks.pop(block_id, None)
         if block is None:
@@ -197,6 +320,7 @@ class HybridCache:
 
         [FIFO Eviction] When free pool is exhausted, batch-evict the oldest
         10%% of allocated blocks (by allocation order) without ref_count check.
+        Skips pinned blocks.
         """
         if not prompt_tokens:
             raise ValueError("allocate() requires at least one token")
@@ -209,12 +333,22 @@ class HybridCache:
         if not free:
             n_evict = max(1, int(self.total_blocks * 0.10))
             evicted = 0
-            for bid in list(blocks.keys())[:n_evict]:
-                self._free_block_forced(bid)
-                evicted += 1
-            logger.debug("FIFO eviction: evicted %d oldest blocks", evicted)
+            # Evict oldest unpinned blocks (iterate copy to avoid mutation issues)
+            candidates = list(blocks.keys())
+            for bid in candidates[:n_evict * 2]:  # extra headroom for pinned skip
+                if not free:
+                    break
+                if bid in blocks and not blocks[bid].pinned:
+                    self._free_block_forced(bid)
+                    evicted += 1
+                if evicted >= n_evict:
+                    break
+            logger.debug("FIFO eviction: evicted %d oldest unpinned blocks", evicted)
             if not free:
-                raise RuntimeError("No free blocks available after FIFO eviction")
+                # Try evicting one pinned block as last resort
+                self._evict_oldest_pinned()
+                if not free:
+                    raise RuntimeError("No free blocks available after FIFO eviction")
 
         block_id = free.pop()
 
@@ -223,6 +357,7 @@ class HybridCache:
             token_ids=prompt_tokens,
             kv_tensor=None,
             ref_count=1,
+            pinned=False,
         )
         blocks[block_id] = new_block
 
@@ -644,17 +779,25 @@ class HybridCache:
         """
         Decrease the reference count of a block.
 
+        Pinned blocks are NOT freed (call ``unpin_block`` first).
+
         [Bug 2] Removes block_id from radix_index sets rather than deleting
         straight dict entries.
         """
-        free = self.free_block_queue
-        blocks = self.allocated_blocks
-        radix = self.radix_index
-
-        block = blocks.get(block_id)
+        block = self.allocated_blocks.get(block_id)
         if block is None:
             logger.warning("free_block: block %d not found", block_id)
             return
+
+        # Pinned blocks: just decrement ref count but don't free
+        if block.pinned:
+            block.ref_count -= 1
+            logger.debug("free_block %d (pinned): ref_count now %d", block_id, block.ref_count)
+            return
+
+        free = self.free_block_queue
+        blocks = self.allocated_blocks
+        radix = self.radix_index
 
         block.ref_count -= 1
         logger.debug("free_block %d: ref_count now %d", block_id, block.ref_count)
@@ -663,6 +806,8 @@ class HybridCache:
             free.append(block_id)
             blocks.pop(block_id, None)
             self._block_kv_cache.pop(block_id, None)
+            with contextlib.suppress(ValueError):
+                self._pinned_lru.remove(block_id)
             stale = [h for h, bids in radix.items() if block_id in bids]
             for h in stale:
                 radix[h].discard(block_id)
@@ -713,10 +858,15 @@ class HybridCache:
     def free_blocks(self) -> int:
         return len(self.free_block_queue)
 
+    @property
+    def pinned_count(self) -> int:
+        return len(self._pinned_lru)
+
     def stats(self) -> dict[str, int]:
         return {
             "total_blocks": self.total_blocks,
             "used_blocks": self.used_blocks,
             "free_blocks": self.free_blocks,
             "radix_entries": len(self.radix_index),
+            "pinned_blocks": self.pinned_count,
         }

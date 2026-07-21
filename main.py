@@ -21,6 +21,7 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import argparse
+import math
 import asyncio
 import contextlib
 import logging
@@ -31,12 +32,22 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
+# ── 初始化统一日志系统 ────────────────────────────────────────────────
+# 零基础用户无需配置，默认即可获得简洁清晰的日志输出
+# 命令行加 -v 查看更多细节，加 --verbose 也一样
+from moe_logger import (  # noqa: E402
+    apply_module_levels,
+    get_logger,
+    print_banner,
+    print_optimizations,
+    print_model_summary,
+    print_engine_ready,
+    print_request_summary,
+    log_runtime_vram,
 )
-logger = logging.getLogger("engine")
+
+apply_module_levels()
+logger = get_logger("engine")
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +89,28 @@ import importlib.util
 _MAIN_GOOSE_OK = importlib.util.find_spec('goose_core') is not None
 
 _HAS_GGUF = False
+
+_SKELETON_AVAILABLE = False
+try:
+    from goose_core import SkeletonDraftGenerator  # noqa: F401
+    _SKELETON_AVAILABLE = True
+except ImportError:
+    pass
+
+_AFCE_AVAILABLE = False
+try:
+    import afce  # noqa: F401
+    _AFCE_AVAILABLE = True
+except ImportError:
+    pass
+
+_OEF_AVAILABLE = False
+try:
+    import oef  # noqa: F401
+    _OEF_AVAILABLE = True
+except ImportError:
+    pass
+
 try:
     from model_loader import load_model as load_gguf_model
     from model_loader.gguf_reader import GGUFFile as _GGUFFile  # noqa: F401
@@ -499,25 +532,68 @@ async def main() -> None:
         help="Fixed generation token length for benchmark (default: 128)",
     )
     parser.add_argument(
+        "--no-speculative",
+        action="store_true",
+        help="Disable Goose speculative decoding (auto-enabled when goose_core is available)",
+    )
+    parser.add_argument(
         "--speculative",
         action="store_true",
-        help="Enable Goose speculative decoding (for benchmark or API mode)",
+        dest="_spec_legacy",
+        help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    # ── 启动徽标 ─────────────────────────────────────
+    print_banner()
+
+    # ---- VRAM Budget Manager ----
+    from vram_budget import VRAMBudget  # noqa: PLC0415
+
+    # Estimate model config for budget before loading
+    _is_gguf = args.gguf or (args.model and args.model.endswith(".gguf"))
+    _model_hidden_size = args.hidden_size if not _is_gguf else (args.hidden_size)
+    _model_num_layers = 32
+    _model_num_experts = 8
+    _model_is_moe = False
+    _model_params_b = None
+
+    budget = VRAMBudget(
+        model_params_b=_model_params_b,
+        hidden_size=_model_hidden_size,
+        num_layers=_model_num_layers,
+        num_experts=_model_num_experts,
+        is_moe=_model_is_moe,
+        block_size=args.block_size or 16,
+    )
+
+    # ---- Log VRAM budget BEFORE loading model (to capture baseline free VRAM) ----
+    budget.log_status()
+
+    # ---- Log auto-enabled optimizations ----
+    print_optimizations(
+        hf_ok=not _is_gguf,
+        gguf_ok=_is_gguf,
+        goose_ok=_MAIN_GOOSE_OK and not args.no_speculative,
+        self_spec_ok=_MAIN_GOOSE_OK and _SKELETON_AVAILABLE,
+        afce_ok=_AFCE_AVAILABLE,
+        oef_ok=_OEF_AVAILABLE,
+        speculative_disabled=args.no_speculative,
+    )
+
     # ---- Long context configuration ----
     from long_context import LongContextConfig  # noqa: PLC0415
     lc_config = LongContextConfig.from_cli(args)
     if lc_config.enabled:
-        logger.info("Long context extension: %s (auto-enabled, use --disable-long-context to turn off)", lc_config)
+        logger.info("  🌐 超长上下文: %s (--disable-long-context 关闭)", lc_config)
     set_long_context_config(lc_config)
 
     # ---- Load model ----
     tokenizer = None
-    if args.gguf or (args.model and args.model.endswith(".gguf")):
+    if _is_gguf:
         gguf_path = args.gguf or args.model
         model = load_and_inject_gguf_model(
             gguf_path=gguf_path,
@@ -530,26 +606,45 @@ async def main() -> None:
         model, tokenizer = load_and_inject_model(args.model, load_tokenizer=(args.api_port > 0))
         model_hidden_size = args.hidden_size
         block_size = args.block_size or 16
+        # Update budget with actual model info now that it's loaded
+        budget._is_moe = getattr(model.config, 'model_type', '') in ('mixtral', 'qwen2_moe', 'deepseek_v2', 'deepseek_v3', 'jetmoe')
+        budget._num_layers = getattr(model.config, 'num_hidden_layers', _model_num_layers)
+        budget._num_experts = getattr(model.config, 'num_local_experts', _model_num_experts)
+
+    # ---- Print model summary ----
+    _is_moe = getattr(model, 'is_moe', budget._is_moe)
+    _params_b = getattr(model, 'estimated_parameter_count_b', None)
+    print_model_summary(
+        model_type="gguf" if _is_gguf else "hf",
+        model_name=args.gguf or args.model,
+        hidden_size=model_hidden_size,
+        num_layers=budget._num_layers,
+        num_experts=budget._num_experts,
+        is_moe=_is_moe,
+        params_b=_params_b,
+    )
 
     # ---- Create cache & scheduler ----
     cache = HybridCache(
         block_size=block_size,
         hidden_size=model_hidden_size,
-        total_blocks=args.total_blocks,
+        total_blocks=args.total_blocks or budget.safe_total_blocks(),
     )
     scheduler = UnifiedScheduler(
         model,
         cache,
         detokenizer=tokenizer.decode if tokenizer is not None else None,
+        vram_budget=budget,
     )
 
-    # [Goose] Initialize speculative decoding if requested
-    if args.speculative:
-        if _MAIN_GOOSE_OK:
-            scheduler._init_goose(tree_enabled=False, max_draft=5)
-            logger.info("Goose speculative decoding enabled (Phase 0/1 — linear chain)")
-        else:
-            logger.warning("--speculative requested but goose_core not available; ignoring.")
+    # [Goose] Speculative decoding is auto-enabled when goose_core is available.
+    # Use --no-speculative to disable.
+    if args.no_speculative and _MAIN_GOOSE_OK:
+        scheduler._goose_enabled = False
+        scheduler._goose_engine = None
+        logger.info("Goose speculative decoding disabled via --no-speculative")
+    elif _MAIN_GOOSE_OK:
+        logger.info("Goose speculative decoding enabled (auto — use --no-speculative to disable)")
 
     # ---- Signal handling ----
     def _signal_handler(signum, frame):
@@ -564,17 +659,16 @@ async def main() -> None:
     if args.api_port > 0:
         from api_server import run_api_server  # noqa: PLC0415
 
+        _model_name = args.gguf or args.model
         api_task = asyncio.create_task(
             run_api_server(
                 scheduler=scheduler,
                 host=args.api_host,
                 port=args.api_port,
                 tokenizer_decoder=tokenizer,
+                model_name=_model_name if _model_name else None,
             )
         )
-    else:
-        logger.info("API server disabled (--api-port=0). Running engine loop only.")
-
     # ---- Route: Benchmark or Engine loop ----
     if args.benchmark:
         await run_benchmark(
@@ -586,8 +680,8 @@ async def main() -> None:
         logger.info("Benchmark complete.")
         return
 
-    # ---- Engine loop (drives scheduler periodically) ----
-    logger.info("Engine running.")
+    # ---- Engine ready ----
+    print_engine_ready(api_port=args.api_port if args.api_port > 0 else 0)
 
     try:
         while scheduler._running:
