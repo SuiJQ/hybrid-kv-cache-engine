@@ -1,5 +1,5 @@
 """
-api_server.py — Fully OpenAI-compatible async HTTP API server for MoeOwner.
+api_server.py — Fully OpenAI-compatible async HTTP API server for PyDense.
 
 Endpoints
 ---------
@@ -374,13 +374,13 @@ def _handle_models(model_name: str | None = None) -> dict:
     ``model_name`` should be set from the loaded model (e.g. ``"Qwen/Qwen2.5-1.5B-Instruct"``).
     Falls back to a placeholder when unknown.
     """
-    name = model_name or "MoeOwner"
+    name = model_name or "PyDense"
     data = [
         {
             "id": name,
             "object": "model",
             "created": int(time.time()),
-            "owned_by": "MoeOwner",
+            "owned_by": "PyDense",
             "permission": [],
         }
     ]
@@ -497,7 +497,7 @@ def _build_completions_response(
         "id": request_id,
         "object": "text_completion",
         "created": int(time.time()),
-        "model": "MoeOwner",
+        "model": "PyDense",
         "choices": [
             {
                 "text": text,
@@ -536,7 +536,7 @@ async def _handle_chat_completions(
     if isinstance(stop_strs, str):
         stop_strs = [stop_strs]
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-    model_name_resp = model_name or req_data.get("model", "MoeOwner")
+    model_name_resp = model_name or req_data.get("model", "PyDense")
 
     # ── Convert messages to prompt ──
     prompt = _format_chat_prompt(messages)
@@ -693,7 +693,7 @@ async def _sse_stream_chat(
     """
     request_id = params["request_id"]
     max_tokens = params["max_tokens"]
-    model = params.get("model", "MoeOwner")
+    model = params.get("model", "PyDense")
     tokenizer_decoder = params["tokenizer_decoder"]
     stop_strs = params.get("stop_strs")
 
@@ -909,7 +909,7 @@ async def _handle_client(
 
     # ── Health check ──
     if method == "GET" and path in {"/health", "/"}:
-        writer.write(_build_response(200, {"status": "ok", "engine": "MoeOwner"}))
+        writer.write(_build_response(200, {"status": "ok", "engine": "PyDense"}))
         await writer.drain()
         writer.close()
         return
@@ -1023,7 +1023,7 @@ async def run_api_server(
     server = await asyncio.start_server(_on_connect, host, port)
     addr = server.sockets[0].getsockname()
     logger.info("API server listening on http://%s:%d", addr[0], addr[1])
-    print(f"\n━━━ MoeOwner API running at http://{addr[0]}:{addr[1]} ━━━")
+    print(f"\n━━━ PyDense API running at http://{addr[0]}:{addr[1]} ━━━")
     print("     POST /v1/completions        — Text completion (streaming supported)")
     print("     POST /v1/chat/completions    — Chat completion (streaming, reasoning supported)")
     print("     GET  /v1/models              — Model info")

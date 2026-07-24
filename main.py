@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MoeOwner — 稠密模型推理引擎 (极致性价比版)
+PyDense — 稠密模型推理引擎 (极致性价比版)
 =============================================
 
 性能特性（全部自动开启，零配置）：
@@ -474,7 +474,7 @@ class InferenceServer:
         """类似 ollama run 的终端聊天。"""
         print()
         print("=" * 60)
-        print("  MoeOwner 交互式聊天 (Ctrl+D / /exit 退出)")
+        print("  PyDense 交互式聊天 (Ctrl+D / /exit 退出)")
         print("  " + "-" * 56)
         print("  /clear  清空历史  /model  显示模型信息")
         print("=" * 60)
@@ -579,7 +579,7 @@ async def benchmark(server: InferenceServer, plen=128, glen=128):
 
 def build_parser():
     p = argparse.ArgumentParser(
-        description="MoeOwner — 稠密模型推理引擎",
+        description="PyDense — 稠密模型推理引擎",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

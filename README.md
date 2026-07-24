@@ -1,4 +1,4 @@
-# MoeOwner
+# PyDense
 
 > **稠密模型推理引擎** — 纯 Transformers 融合 FlashAttention + PagedAttention/RadixAttention KV Cache + Goose 推测解码
 >
@@ -14,7 +14,7 @@
 
 ## 项目定位
 
-**MoeOwner** 是一个面向**稠密（Dense）Transformer 模型**的生产级推理引擎，基于 HuggingFace Transformers + BitsAndBytes 加载模型，融合以下核心技术：
+**PyDense** 是一个面向**稠密（Dense）Transformer 模型**的生产级推理引擎，基于 HuggingFace Transformers + BitsAndBytes 加载模型，融合以下核心技术：
 
 | 组件 | 文件 | 功能 |
 |------|------|------|
@@ -33,7 +33,7 @@
 
 ## 🎯 零手动调优 — 插电即用
 
-**MoeOwner 的所有优化全部自动开启，零参数、零配置、零手动调优。** 用户只需 `python main.py --model Qwen/Qwen2.5-7B-Instruct`，其余全部自动完成：
+**PyDense 的所有优化全部自动开启，零参数、零配置、零手动调优。** 用户只需 `python main.py --model Qwen/Qwen2.5-7B-Instruct`，其余全部自动完成：
 
 | 优化项 | 自动生效方式 |
 |--------|-------------|
@@ -158,7 +158,7 @@ python main.py --model Qwen/Qwen2.5-1.5B-Instruct --benchmark --prompt-len 2048 
 - **Phi**: Phi-3/Phi-3.5 系列
 - **其他**: 任何 `AutoModelForCausalLM` 支持的模型
 
-> **注意**: MoeOwner 专为**稠密 Transformer 模型**设计，不兼容 MoE 模型（如 Mixtral、DeepSeek-V2/V3、Qwen2-MoE）。
+> **注意**: PyDense 专为**稠密 Transformer 模型**设计，不兼容 MoE 模型（如 Mixtral、DeepSeek-V2/V3、Qwen2-MoE）。
 
 ---
 
@@ -243,7 +243,7 @@ python main.py --model Qwen/Qwen2.5-72B-Instruct --quantize 4bit
 
 ### Core Architecture
 
-MoeOwner is a dense Transformer inference engine built on HuggingFace Transformers:
+PyDense is a dense Transformer inference engine built on HuggingFace Transformers:
 
 - **KV Cache**: PagedAttention + RadixAttention hybrid
 - **Scheduler**: Chunked prefill + decode with dual CUDA streams

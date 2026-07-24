@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MoeOwner 引导式启动器 — 零基础用户友好入口
+PyDense 引导式启动器 — 零基础用户友好入口
 ===============================================
 
 自动完成：环境检测 → 依赖安装 → 模型下载 → 启动引擎
@@ -327,7 +327,7 @@ def select_model(gpu_vram_gb: float = 0) -> tuple[str, str | None, str | None]:
 
 BANNER = f"""
 {c('╔════════════════════════════════════════════╗', Style.CYAN)}
-{c('║', Style.CYAN)}    {c('MoeOwner — 稠密模型推理引擎', Style.BOLD, Style.CYAN)}    {c('║', Style.CYAN)}
+{c('║', Style.CYAN)}    {c('PyDense — 稠密模型推理引擎', Style.BOLD, Style.CYAN)}    {c('║', Style.CYAN)}
 {c('║', Style.CYAN)}    {c('FlashAttention + KV Cache + 推测解码', Style.DIM)}    {c('║', Style.CYAN)}
 {c('╚════════════════════════════════════════════╝', Style.CYAN)}
 """
@@ -421,7 +421,7 @@ def run_interactive():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MoeOwner 引导式启动器",
+        description="PyDense 引导式启动器",
     )
     parser.add_argument("--auto", action="store_true", help="全自动模式（默认配置）")
     parser.add_argument("--quick", action="store_true", help="跳过依赖检查")

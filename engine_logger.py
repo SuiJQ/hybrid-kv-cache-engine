@@ -1,5 +1,5 @@
 """
-engine_logger.py — MoeOwner 统一日志系统
+engine_logger.py — PyDense 统一日志系统
 
 集中管理全系统日志输出，自动抑制内部模块的细碎日志，仅展示里程碑事件。
 零基础用户无需任何配置即得清晰日志。
@@ -101,7 +101,7 @@ def print_banner() -> None:
     """打印启动横幅。"""
     banner = f"""
 {'=' * 60}
-  MoeOwner — 稠密模型推理引擎
+  PyDense — 稠密模型推理引擎
   Dense Transformer Inference with FlashAttention + KV Cache + Speculative Decoding
 {'=' * 60}
 """

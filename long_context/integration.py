@@ -1,6 +1,6 @@
 # long_context/integration.py
 """
-Long Context — MoeOwner Integration Module
+Long Context — PyDense Integration Module
 ============================================
 
 Wires SelfExtend and ReAttention into the existing inference pipeline.
@@ -18,7 +18,7 @@ Injection Points
 
 Compatibility
 -------------
-All methods are **fully compatible** with existing MoeOwner modules:
+All methods are **fully compatible** with existing PyDense modules:
   - Goose speculative decode
   - HybridCache
 

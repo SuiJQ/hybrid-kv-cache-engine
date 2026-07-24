@@ -36,7 +36,7 @@ Practical Effect
 - LLaMA3.2-3B : 4M tokens (128× beyond training length)
 - General     : Vanilla Transformer up to 1M+ without any fine-tuning
 
-MoeOwner Integration
+PyDense Integration
 --------------------
 ReAttention is injected at the attention kernel level, wrapping
 ``FlashAttentionKernel.forward``.  It is fully compatible with:

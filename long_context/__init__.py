@@ -1,6 +1,6 @@
 # long_context/__init__.py
 """
-MoeOwner Long Context Extension Suite
+PyDense Long Context Extension Suite
 =======================================
 
 Two training-free, framework-level context window extension techniques

@@ -12,7 +12,7 @@ reasoning.
 Integration
 -----------
 Use ``ToolOrchestrator.generate()`` as a drop-in wrapper around the
-scheduler's submit+poll flow.  Designed for MoeOwner inference engine,
+scheduler's submit+poll flow.  Designed for PyDense inference engine,
 requires zero third-party dependencies.
 
 Conventions
@@ -1453,7 +1453,7 @@ def create_orchestrator(
     Parameters
     ----------
     scheduler:
-        The MoeOwner ``UnifiedScheduler`` instance.
+        The PyDense ``UnifiedScheduler`` instance.
     detokenizer:
         Callable ``list[int] → str`` for decoding token IDs.
         Pass ``tokenizer.decode`` from the loaded HF tokenizer.
