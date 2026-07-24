@@ -17,7 +17,7 @@ Design Principles
 - Zero weight modification
 - Zero training / fine-tuning
 - Zero architecture changes (pure inference-time logic)
-- Full compatibility with existing hooks (Goose, AFCE, OEF, SERE, KV cache)
+- Full compatibility with existing hooks (Goose speculative decoding, KV cache)
 - Configurable per-deployment via CLI flags or config dict
 """
 

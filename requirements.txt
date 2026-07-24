@@ -1,15 +1,18 @@
-# === Core engine dependencies ===
-torch==2.13.0
-transformers==5.14.1
+# === Core Dependencies ===
+torch>=2.0.0
+transformers>=4.38.0
+huggingface_hub>=0.20.0
+numpy>=1.24.0
 
-# === GGUF model loader (pure Python, no llama-cpp-python) ===
-# numpy is required by PyTorch and tests
-numpy>=2.0
+# === Development & Testing ===
+ruff>=0.15.0
+pytest>=8.0.0
 
-# === Development & code review ===
-ruff>=0.15.22
-pytest>=9.1.1
+# === Optional: Quantization ===
+# bitsandbytes>=0.43.0
 
-# === Optional: HTTP service ===
-# fastapi
-# uvicorn[standard]
+# === Optional: Tokenizer ===
+# sentencepiece>=0.2.0
+
+# === Optional: Large model loading ===
+# accelerate>=0.28.0

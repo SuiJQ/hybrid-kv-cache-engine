@@ -1,61 +1,68 @@
 #!/usr/bin/env python3
 """
-Pure Python Inference Engine — MoE-first Inference Server with HTTP API.
+MoeOwner — 稠密模型推理引擎 (极致性价比版)
+=============================================
 
-Long context extension (auto-enabled — SelfExtend by default):
-    python main.py --model Qwen/Qwen2.5-1.5B-Instruct                                    # SelfExtend 自动开启
-    python main.py --model Qwen/Qwen2.5-1.5B-Instruct --context-method reattention        # 切换为 ReAttention
-    python main.py --gguf models/Model.gguf                                               # SelfExtend 自动开启
-    python main.py --model Qwen/Qwen2.5-32B --context-method yarn --yarn-factor 16        # 使用 YaRN
-    python main.py --model ... --disable-long-context                                     # 手动关闭
+性能特性（全部自动开启，零配置）：
+  • FlashAttention SDPA + torch.compile
+  • PagedAttention/RadixAttention 混合 KV 缓存
+  • Chunked Prefill (Sarathi) + 双 CUDA 流管线
+  • Goose 推测解码 (PLD + 树注意力)
+  • Self-Spec 骨架推测 (ACL'24)
+  • 自适应 KV 压缩 (StreamingLLM + H2O)
+  • 投机解码 (小模型草稿)
 
-The long context module adds ZERO weight changes — it's pure inference-time
-logic injected at the attention level.  Auto-enabled by default. See ``long_context/``.
+使用方式：
+    python main.py                           # 默认 Qwen2.5-7B
+    python main.py --model Qwen/Qwen2.5-7B chat   # 交互聊天
+    python main.py --model Qwen/Qwen2.5-72B --quantize 4bit  # 量化
+
+镜像源（自动 fallback）：
+    huggingface — https://huggingface.co (官方)
+    hf-mirror   — https://hf-mirror.com (国内高速)
+    modelscope  — modelScope SDK (阿里云)
 """
 
-# ═══════════════════════════════════════════════════════════════════════════
-# [Step 0] Env var MUST be set before any import touches torch.
-# ═══════════════════════════════════════════════════════════════════════════
 import os
+import sys
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import argparse
-import math
 import asyncio
-import contextlib
+import importlib
+import json
 import logging
+import math
+import platform
 import signal
-import sys
+import subprocess
 import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# ── 初始化统一日志系统 ────────────────────────────────────────────────
-# 零基础用户无需配置，默认即可获得简洁清晰的日志输出
-# 命令行加 -v 查看更多细节，加 --verbose 也一样
-from moe_logger import (  # noqa: E402
-    apply_module_levels,
-    get_logger,
-    print_banner,
-    print_optimizations,
-    print_model_summary,
-    print_engine_ready,
-    print_request_summary,
-    log_runtime_vram,
+from cache_manager import HybridCache
+from engine_logger import (
+    apply_module_levels, get_logger, print_banner,
+    print_engine_ready, print_model_summary,
+    print_optimizations, print_request_summary,
 )
+from scheduler import DecodeRequest, Request, UnifiedScheduler
+from tool_sink import ToolOrchestrator
+from vram_budget import VRAMBudget
 
 apply_module_levels()
 logger = get_logger("engine")
 
 
-# ---------------------------------------------------------------------------
-# Stage 2: Global torch performance configuration
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# 全局 torch 优化
+# ═══════════════════════════════════════════════════════════════════════════
 
-
-def configure_global_torch() -> None:
+def configure_torch() -> None:
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_math_sdp(False)
     torch.backends.cuda.enable_mem_efficient_sdp(False)
@@ -64,639 +71,605 @@ def configure_global_torch() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cuda.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
+    # 创建专属 CUDA 流（用于权重复制等后台操作）
     torch.cuda.set_stream(torch.cuda.Stream())
-    logger.info("Tier 1 zero-cost optimisations applied.")
+    logger.info("Global torch optimizations: Flash SDPA, TF32, cuDNN benchmark")
+
+configure_torch()
 
 
-configure_global_torch()
+# ═══════════════════════════════════════════════════════════════════════════
+# 多镜像源下载模块
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class MirrorConfig:
+    name: str = "huggingface"
+    endpoint: str = ""
+
+    MIRRORS: dict = field(default_factory=lambda: {
+        "huggingface": "https://huggingface.co",
+        "hf-mirror": "https://hf-mirror.com",
+    })
+
+    @classmethod
+    def resolve(cls, mirror_arg: str | None = None) -> "MirrorConfig":
+        if mirror_arg:
+            name = mirror_arg.lower().replace("_", "-")
+            if name in cls.MIRRORS:
+                ep = cls.MIRRORS[name]
+                logger.info("Mirror: %s → %s", name, ep)
+                return cls(name=name, endpoint=ep)
+            # 可能是自定义 URL
+            logger.info("Mirror (custom): %s", mirror_arg)
+            return cls(name="custom", endpoint=mirror_arg)
+
+        env_ep = os.environ.get("HF_ENDPOINT", "")
+        if env_ep:
+            return cls(name="env", endpoint=env_ep)
+
+        # 自动检测国内环境
+        try:
+            locale = os.environ.get("LANG", "")
+            tz = os.environ.get("TZ", "")
+            cn_hints = ("zh_CN", "zh-CN", "Asia/Shanghai", "CST-8")
+            if any(h in locale or h in tz for h in cn_hints):
+                logger.info("Auto-detected China locale → hf-mirror")
+                return cls(name="hf-mirror", endpoint="https://hf-mirror.com")
+        except Exception:
+            pass
+
+        return cls(name="huggingface", endpoint="https://huggingface.co")
+
+    def apply(self) -> None:
+        if self.endpoint:
+            os.environ["HF_ENDPOINT"] = self.endpoint
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.endpoint})" if self.endpoint else self.name
+
+    def __repr__(self) -> str:
+        return self.__str__()
 
 
-# ---------------------------------------------------------------------------
-# Stage 3: Import engine modules
-# ---------------------------------------------------------------------------
+def ensure_model(
+    model_name: str,
+    mirror_arg: str | None = None,
+    tool_name: str = "",
+) -> MirrorConfig:
+    """确保模型已下载，支持多镜像 fallback。"""
+    from huggingface_hub import scan_cache_dir
 
-try:
-    from cache_manager import Block, HybridCache  # noqa: F401
-    from scheduler import DecodeRequest, Request, UnifiedScheduler  # noqa: F401
+    logger.info("Ensuring model: %s", model_name)
 
-    logger.info("Imported cache_manager & scheduler modules")
-except ImportError as exc:
-    logger.error("Failed to import engine modules: %s", exc)
-    sys.exit(1)
+    # 优先：直接使用环境变量中的 endpoint
+    env_ep = os.environ.get("HF_ENDPOINT", "")
+    mirrors_try = []
 
-# [Goose] Check availability of the speculative decoding module
-import importlib.util
-_MAIN_GOOSE_OK = importlib.util.find_spec('goose_core') is not None
+    if mirror_arg:
+        mirrors_try.append(MirrorConfig.resolve(mirror_arg))
+    if env_ep and not mirror_arg:
+        mirrors_try.append(MirrorConfig(name="env", endpoint=env_ep))
 
-_HAS_GGUF = False
+    # 默认镜像优先级
+    if not mirrors_try:
+        mirror = MirrorConfig.resolve(None)  # 自动检测
+        if mirror.name == "hf-mirror":
+            mirrors_try = [mirror]
+            mirrors_try.append(MirrorConfig(name="huggingface", endpoint="https://huggingface.co"))
+        else:
+            mirrors_try = [MirrorConfig(name="huggingface", endpoint="https://huggingface.co")]
+            mirrors_try.append(MirrorConfig(name="hf-mirror", endpoint="https://hf-mirror.com"))
 
-_SKELETON_AVAILABLE = False
-try:
-    from goose_core import SkeletonDraftGenerator  # noqa: F401
-    _SKELETON_AVAILABLE = True
-except ImportError:
-    pass
+    # 检查缓存
+    try:
+        cache_info = scan_cache_dir()
+        for repo in cache_info.repos:
+            if repo.repo_id == model_name and repo.repo_type == "model":
+                logger.info("Model already cached: %s", model_name)
+                mirrors_try[0].apply()
+                return mirrors_try[0]
+    except Exception:
+        pass
 
-_AFCE_AVAILABLE = False
-try:
-    import afce  # noqa: F401
-    _AFCE_AVAILABLE = True
-except ImportError:
-    pass
+    # 逐个尝试
+    last_error = None
+    for i, m in enumerate(mirrors_try):
+        try:
+            _download_model(model_name, m)
+            logger.info("Downloaded via %s (%s)", m.name, m.endpoint)
+            return m
+        except Exception as e:
+            last_error = e
+            logger.warning("Mirror %s failed: %s", m.name, e)
 
-_OEF_AVAILABLE = False
-try:
-    import oef  # noqa: F401
-    _OEF_AVAILABLE = True
-except ImportError:
-    pass
-
-try:
-    from model_loader import load_model as load_gguf_model
-    from model_loader.gguf_reader import GGUFFile as _GGUFFile  # noqa: F401
-
-    _HAS_GGUF = True
-except ImportError:
-    pass
-
-
-# ---------------------------------------------------------------------------
-# Stage 4: Model loading & kernel injection (with long context support)
-# ---------------------------------------------------------------------------
-
-
-_LONG_CONTEXT_LC_CONFIG: object = None
-
-
-def set_long_context_config(config: object) -> None:
-    """Set the global long context config used during model injection."""
-    global _LONG_CONTEXT_LC_CONFIG
-    _LONG_CONTEXT_LC_CONFIG = config
+    raise RuntimeError(
+        f"Cannot download model {model_name} after {len(mirrors_try)} mirrors. "
+        f"Last error: {last_error}"
+    )
 
 
-def _inject_attention_kernel(layer: torch.nn.Module) -> None:
-    """
-    Replace ``self_attn.forward`` with flash SDPA kernel.
+def _download_model(model_name: str, mirror: MirrorConfig) -> None:
+    """从指定镜像下载模型。"""
+    old_ep = os.environ.get("HF_ENDPOINT", "")
+    mirror.apply()
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(
+            repo_id=model_name,
+            ignore_patterns=["*.ot", "*.msgpack", "*.h5", "*.safetensors.index.json"],
+            resume_download=True,
+            local_files_only=False,
+            max_workers=4,
+        )
+    except Exception:
+        # 如果 snapshot_download 失败，尝试通过 transformers 直接加载
+        from transformers import AutoConfig
+        AutoConfig.from_pretrained(model_name)
+    finally:
+        if old_ep:
+            os.environ["HF_ENDPOINT"] = old_ep
+        else:
+            os.environ.pop("HF_ENDPOINT", None)
 
-    If long context (SelfExtend / ReAttention) is configured, wraps the
-    kernel with the extended attention logic.  Falls back to vanilla
-    flash attention otherwise (or if YaRN is selected, which is a config-
-    level setting in HF Transformers).
-    """
-    global _LONG_CONTEXT_LC_CONFIG
-    lcc = _LONG_CONTEXT_LC_CONFIG
 
-    # ── SelfExtend / ReAttention: use the long-context-aware injector ──
-    if lcc is not None and getattr(lcc, "enabled", False) and getattr(lcc, "method", "none") in ("selfextend", "reattention"):
-        from long_context.integration import LongContextAttentionInjector  # noqa: PLC0415
-        injector = LongContextAttentionInjector(lcc)
-        attn = getattr(layer, "self_attn", None)
-        if attn is not None:
-            attn.forward = injector._make_patched_forward(attn)
-            attn.long_context_injected = True
-            attn.is_causal = True
-        return
+# ═══════════════════════════════════════════════════════════════════════════
+# 模型加载
+# ═══════════════════════════════════════════════════════════════════════════
 
-    # ── Vanilla flash attention (YaRN / none) ──
-    from attention_kernel import FlashAttentionKernel  # noqa: PLC0415
+_GOOSE_OK = importlib.util.find_spec("goose_core") is not None
+
+def _inject_attention(layer: torch.nn.Module) -> None:
+    """替换注意力层为 FlashAttention 内核。"""
+    from attention_kernel import FlashAttentionKernel
 
     attn = getattr(layer, "self_attn", None)
     if attn is None:
         return
 
-    def _patched_forward(
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        past_key_value=None,
-        use_cache: bool = False,
-        position_ids: torch.Tensor | None = None,
-        **kwargs,
-    ) -> tuple:
-        batch_size, seq_len, _ = hidden_states.shape
+    orig_fwd = getattr(attn, "forward", None)
+
+    def patched_forward(
+        hidden_states, attention_mask=None,
+        past_key_value=None, use_cache=False,
+        position_ids=None, **kwargs,
+    ):
+        bs, sl, _ = hidden_states.shape
         q = attn.q_proj(hidden_states)
         k = attn.k_proj(hidden_states)
         v = attn.v_proj(hidden_states)
 
-        num_heads = attn.num_heads
-        num_kv_heads = getattr(attn, "num_key_value_heads", num_heads)
-        head_dim = attn.head_dim
+        nh = attn.num_heads
+        nkv = getattr(attn, "num_key_value_heads", nh)
+        hd = attn.head_dim
+        scale = hd ** -0.5
 
-        q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+        q = q.view(bs, sl, nh, hd).transpose(1, 2)
+        k = k.view(bs, sl, nkv, hd).transpose(1, 2)
+        v = v.view(bs, sl, nkv, hd).transpose(1, 2)
 
-        # Concatenate cached KV for incremental decode
         if past_key_value is not None:
-            k = torch.cat([past_key_value[0], k], dim=2)
-            v = torch.cat([past_key_value[1], v], dim=2)
+            k_old, v_old = past_key_value
+            k = torch.cat([k_old.to(k.device), k], dim=2)
+            v = torch.cat([v_old.to(v.device), v], dim=2)
 
-        softmax_scale = head_dim**-0.5
-        attn_output = FlashAttentionKernel.forward(
-            q, k, v,
-            softmax_scale=softmax_scale,
+        out = FlashAttentionKernel.forward(
+            q, k, v, scale,
             causal=(attention_mask is None),
             attn_mask=attention_mask,
         )
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(batch_size, seq_len, -1)
-        attn_output = attn_output.to(hidden_states.dtype)
-        attn_output = attn.o_proj(attn_output)
+        out = out.transpose(1, 2).contiguous().view(bs, sl, -1).to(hidden_states.dtype)
+        out = attn.o_proj(out)
+        return (out, (k, v) if use_cache else None)
 
-        new_kv = (k, v) if use_cache else None
-        return (attn_output, new_kv)
-
-    attn.forward = _patched_forward
+    attn.forward = patched_forward
     attn.is_causal = True
 
 
-def _try_compile_model(
-    model: torch.nn.Module,
-    dummy_input: torch.Tensor,
-) -> torch.nn.Module:
-    """Attempt torch.compile with fallback chain."""
-    for mode, fullgraph in [("reduce-overhead", True), ("default", False)]:
+def load_model(
+    model_name: str,
+    quantize: str | None = None,
+    compile_model: bool = True,
+    draft_model: str | None = None,
+) -> tuple:
+    """加载主模型和可选的投机解码草稿模型。
+
+    Returns:
+        (model, tokenizer, draft_model_or_None, model_info_dict)
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+    logger.info("Loading model: %s ...", model_name)
+
+    # ── Tokenizer ─────────────────────────────────────────────────
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    logger.info("Tokenizer loaded (vocab=%d)", len(tokenizer))
+
+    # ── 模型 ──────────────────────────────────────────────────────
+    kwargs = dict(torch_dtype=torch.float16, low_cpu_mem_usage=True, trust_remote_code=True)
+
+    if quantize:
         try:
-            compiled = torch.compile(model, mode=mode, fullgraph=fullgraph, dynamic=False)
-            with torch.no_grad():
-                compiled(dummy_input)
-            logger.info("torch.compile success (mode=%s, fullgraph=%s)", mode, fullgraph)
-            return compiled
-        except Exception as exc:
-            logger.warning(
-                "torch.compile (mode=%s, fullgraph=%s) failed: %s", mode, fullgraph, exc
-            )
+            import bitsandbytes  # noqa: F401
+            if quantize == "4bit":
+                kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4",
+                )
+            elif quantize == "8bit":
+                kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        except ImportError:
+            logger.warning("bitsandbytes not installed, skipping quantization")
 
-    logger.info("torch.compile permanently disabled — using raw model")
-    return model
-
-
-def load_and_inject_model(
-    model_name: str, load_tokenizer: bool = False
-) -> tuple[torch.nn.Module, object | None]:
-    """Load HF model, inject attention kernels, attempt compile.
-
-    Returns (model, tokenizer_or_None)."""
-    logger.info("Loading HuggingFace model: %s ...", model_name)
-
-    tokenizer = None
-    if load_tokenizer:
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
-            logger.info("Tokenizer loaded")
-        except Exception as exc:
-            logger.warning("Tokenizer load failed: %s", exc)
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-    )
-    model = model.to(device="cuda")
+    model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+    if not quantize:
+        model = model.to(device="cuda")
     model.eval()
 
-    layers = getattr(model.model, "layers", None)
+    # ── 注入 FlashAttention ──────────────────────────────────────
+    layers = getattr(getattr(model, "model", None), "layers", None)
     if layers is not None:
         for layer in layers:
-            _inject_attention_kernel(layer)
-    else:
-        logger.warning("Could not locate model.model.layers; attention injection skipped.")
+            _inject_attention(layer)
+        logger.info("Attention injected: %d layers", len(layers))
 
-    dummy_input = torch.randint(0, 1000, (1, 64), device="cuda")
-    with torch.no_grad():
-        model(dummy_input)
+    # ── 模型信息 ──────────────────────────────────────────────────
+    cfg = model.config
+    info = {
+        "hidden_size": getattr(cfg, "hidden_size", 4096),
+        "num_layers": getattr(cfg, "num_hidden_layers", getattr(cfg, "num_layers", 32)),
+        "num_heads": getattr(cfg, "num_attention_heads", 32),
+        "num_kv_heads": getattr(cfg, "num_key_value_heads", 32),
+        "head_dim": getattr(cfg, "head_dim", 4096 // 32),
+        "vocab_size": getattr(cfg, "vocab_size", 32000),
+        "max_seq_len": getattr(cfg, "max_position_embeddings", 8192),
+    }
 
-    model = _try_compile_model(model, dummy_input)
-    logger.info("HuggingFace model loaded.")
-    return model, tokenizer
-
-
-def load_and_inject_gguf_model(
-    gguf_path: str,
-    device: str = "cuda",
-    block_size: int | None = None,
-) -> torch.nn.Module:
-    """Load model from GGUF file via mmap zero-copy path."""
-    if not _HAS_GGUF:
-        raise ImportError("model_loader not available.")
-
-    if block_size is None:
-        block_size = 32
-
-    logger.info("Loading GGUF model: %s (block_size=%d)", gguf_path, block_size)
-    model = load_gguf_model(
-        path=gguf_path,
-        dtype="fp16",
-        device=device,
-        block_size=block_size,
-    )
-
-    est_params = model.estimated_parameter_count_b
-    suggested_bs = model.suggest_block_size(est_params)
-    if suggested_bs != block_size:
-        logger.info(
-            "Suggested block_size=%d for ~%.1fB model (current=%d)",
-            suggested_bs,
-            est_params,
-            block_size,
-        )
-
-    dummy_input = torch.randint(0, 1000, (1, 64), device="cuda")
-    with torch.no_grad():
-        model(dummy_input)
-
-    model = _try_compile_model(model, dummy_input)
-
-    logger.info(
-        "GGUF model loaded: %d layers, %.1fB params, is_moe=%s",
-        model.num_layers,
-        est_params,
-        getattr(model, "is_moe", False),
-    )
-    return model
-
-
-# ===================================================================
-# Benchmark runner
-# ===================================================================
-
-# A synthetic fixed token pattern.  Using small token IDs works with any
-# model (they embed to some vector) and ensures a repeatable, fixed-length
-# input for fair measurement.
-_SYNTHETIC_SEED: list[int] = [42, 17, 88, 33, 55, 99, 21, 73, 61, 8]
-
-
-def _make_synthetic_prompt(length: int) -> list[int]:
-    """Build a prompt of exactly *length* tokens by repeating a seed."""
-    tokens: list[int] = []
-    while len(tokens) < length:
-        tokens.extend(_SYNTHETIC_SEED[: length - len(tokens)])
-    if len(tokens) < 1:
-        tokens = [42]
-    return tokens
-
-
-async def run_benchmark(
-    scheduler: "UnifiedScheduler",
-    prompt_len: int = 128,
-    gen_len: int = 128,
-) -> dict:
-    """Run a single-request benchmark and return timing measurements.
-
-    Steps
-    -----
-    1. Warmup: prompt_len=32, gen_len=32 -> discarded.
-    2. Measure: prompt_len=prompt_len, gen_len=gen_len.
-    3. Print a formatted report.
-    """
-    prompt = _make_synthetic_prompt(prompt_len)
-    request_id_fmt = "bench_{}"
-
-    def _submit_and_wait(plen: int, glen: int, rid: str) -> dict:
-        req = Request(
-            prompt_tokens=prompt[:plen],
-            request_id=rid,
-            max_new_tokens=glen,
-        )
-        scheduler.submit(req)
-
-        start_wall = time.monotonic()
-        first_token_time = None
-
-        while True:
-            try:
-                loop = asyncio.get_running_loop()
-                loop.run_until_complete(scheduler.step())
-            except RuntimeError:
-                loop2 = asyncio.new_event_loop()
-                loop2.run_until_complete(scheduler.step())
-                loop2.close()
-
-            found = None
-            for dr in scheduler.active_decode_pool:
-                if dr.request_id == rid:
-                    found = dr
+    # ── torch.compile ────────────────────────────────────────────
+    if compile_model:
+        try:
+            dummy = torch.randint(0, 1000, (1, 64), device="cuda" if not quantize else "cpu")
+            with torch.no_grad():
+                model(dummy)
+            for mode, fg in [("reduce-overhead", True), ("default", False)]:
+                try:
+                    model = torch.compile(model, mode=mode, fullgraph=fg, dynamic=False)
+                    model(dummy)
+                    logger.info("torch.compile OK (mode=%s)", mode)
                     break
+                except Exception as e:
+                    logger.warning("torch.compile(%s) failed: %s", mode, e)
+        except Exception as e:
+            logger.warning("Compile warmup failed: %s", e)
 
-            if found is None:
-                time.sleep(0.001)
+    # ── 投机解码草稿模型 ────────────────────────────────────────
+    draft_model_obj = None
+    if draft_model:
+        try:
+            logger.info("Loading draft model: %s ...", draft_model)
+            dm = AutoModelForCausalLM.from_pretrained(
+                draft_model, torch_dtype=torch.float16, trust_remote_code=True,
+            )
+            dm = dm.to(device="cuda")
+            dm.eval()
+            draft_model_obj = dm
+            logger.info("Draft model loaded: %s", draft_model)
+        except Exception as e:
+            logger.warning("Draft model load failed: %s (speculation disabled)", e)
+
+    return model, tokenizer, draft_model_obj, info
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 服务器
+# ═══════════════════════════════════════════════════════════════════════════
+
+class InferenceServer:
+    """推理服务器（极简调度 + 所有优化自动开启）。"""
+
+    def __init__(self, model, tokenizer, draft_model, model_info, mirror, args):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.draft_model = draft_model
+        self.mirror = mirror
+        self.args = args
+        self.info = model_info
+
+        # ── 显存预算 ─────────────────────────────────────────────
+        self.vram_budget = VRAMBudget(
+            hidden_size=model_info["hidden_size"],
+            num_layers=model_info["num_layers"],
+        )
+        self.vram_budget.log_status()
+
+        # ── 混合 KV 缓存 ─────────────────────────────────────────
+        bs = self._auto_block_size(model_info["hidden_size"])
+        tb = self.vram_budget.safe_total_blocks()
+        self.cache = HybridCache(
+            hidden_size=model_info["hidden_size"],
+            num_layers=model_info["num_layers"],
+            block_size=bs, total_blocks=tb,
+            num_kv_heads=model_info["num_kv_heads"],
+            head_dim=model_info["head_dim"],
+        )
+
+        # ── 调度器 ───────────────────────────────────────────────
+        self.scheduler = UnifiedScheduler(
+            model=model, cache=self.cache,
+            detokenizer=self._detok if tokenizer else None,
+            vram_budget=self.vram_budget,
+            draft_model=draft_model,
+            draft_tokenizer=tokenizer,  # 同一 tokenizer
+        )
+
+        # ── 工具 ─────────────────────────────────────────────────
+        self.tool_orch = ToolOrchestrator(model, tokenizer)
+
+        # ── 请求跟踪 ─────────────────────────────────────────────
+        self._req_queue = asyncio.Queue()
+        self._running = True
+        self._req_count = 0
+
+        if platform.system() != "Windows":
+            try:
+                loop = asyncio.get_event_loop()
+                for s in (signal.SIGINT, signal.SIGTERM):
+                    loop.add_signal_handler(s, self._shutdown)
+            except NotImplementedError:
+                pass
+
+    def _shutdown(self):
+        self._running = False
+        self.scheduler.shutdown()
+
+    @staticmethod
+    def _auto_block_size(hs: int) -> int:
+        return 32 if hs >= 7168 else (16 if hs >= 4096 else 8)
+
+    def _detok(self, tokens: list[int]) -> str:
+        return self.tokenizer.decode(tokens, skip_special_tokens=True) if self.tokenizer else ""
+
+    async def generate(self, prompt, max_new=512, temperature=0.7, top_p=0.9):
+        """生成文本（非流式）。"""
+        if isinstance(prompt, str) and self.tokenizer:
+            toks = self.tokenizer.encode(prompt, add_special_tokens=True)
+        elif isinstance(prompt, list):
+            toks = prompt
+        else:
+            toks = [1]
+
+        rid = f"req_{self._req_count}_{time.monotonic_ns()}"
+        self._req_count += 1
+
+        # 工具模式
+        try:
+            r = self.tool_orch.generate(toks, self.scheduler, max_new, temperature, top_p)
+            if isinstance(r, (str, bytes)):
+                return r if isinstance(r, str) else r.decode()
+        except Exception:
+            pass
+
+        self.scheduler.submit(Request(prompt_tokens=toks, request_id=rid, max_new_tokens=max_new))
+        gen = []
+        while self._running:
+            await self.scheduler.step()
+            for d in self.scheduler.active_decode_pool:
+                if d.request_id == rid:
+                    gen.extend(d.generated_tokens[len(gen):])
+                    if d.is_done:
+                        return self._detok(gen)
+            await asyncio.sleep(0.001)
+
+        return self._detok(gen)
+
+    async def chat(self, messages: list[dict], max_new=1024):
+        """聊天接口。"""
+        try:
+            prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            prompt = messages[-1]["content"] if messages else ""
+        return await self.generate(prompt, max_new)
+
+    async def interactive_chat(self):
+        """类似 ollama run 的终端聊天。"""
+        print()
+        print("=" * 60)
+        print("  MoeOwner 交互式聊天 (Ctrl+D / /exit 退出)")
+        print("  " + "-" * 56)
+        print("  /clear  清空历史  /model  显示模型信息")
+        print("=" * 60)
+        print()
+        history = []
+        while self._running:
+            try:
+                inp = input(">>> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nGoodbye!")
+                break
+            if not inp:
+                continue
+            if inp.lower() in ("/exit", "/quit", "/bye"):
+                break
+            if inp.lower() == "/clear":
+                history.clear()
+                print("History cleared")
+                continue
+            if inp.lower() == "/model":
+                print(f"  Model: {self.args.model}")
+                print(f"  Draft: {self.args.draft_model or 'none'}")
+                print(f"  Quantize: {self.args.quantize or 'none'}")
+                print(f"  Mirror: {self.mirror}")
                 continue
 
-            if first_token_time is None:
-                first_token_time = time.monotonic()
-
-            if found.is_done:
-                total_time = time.monotonic() - start_wall
-                gen_tokens = len(found.generated_tokens)
-                ttft = first_token_time - start_wall
-                return {
-                    "ttft_s": ttft,
-                    "e2e_s": total_time,
-                    "gen_tokens": gen_tokens,
-                    "throughput_tok_s": gen_tokens / total_time if total_time > 0 else 0.0,
-                    "decode_steps": found._step_count,  # noqa: SLF001
-                    "spec_enabled": scheduler._goose_enabled,
-                }
-
-            time.sleep(0.001)
-
-    # ---- Warmup (discarded) ----
-    _orig_level = logging.getLogger().getEffectiveLevel()
-    logging.getLogger().setLevel(logging.WARNING)
-    logger.info("Benchmark warmup: 32 -> 32 tokens...")
-    _submit_and_wait(32, 32, request_id_fmt.format("warmup"))
-    logging.getLogger().setLevel(_orig_level)
-
-    # ---- Let speculation engine populate transition table ----
-    if scheduler._goose_enabled:
-        for _ in range(5):
+            history.append({"role": "user", "content": inp})
+            print("... ", end="", flush=True)
             try:
-                loop = asyncio.get_running_loop()
-                loop.run_until_complete(scheduler.step())
-            except RuntimeError:
-                loop2 = asyncio.new_event_loop()
-                loop2.run_until_complete(scheduler.step())
-                loop2.close()
+                resp = await self.chat(history)
+                print("\r" + " " * 60 + "\r", end="")
+                print(resp)
+                history.append({"role": "assistant", "content": resp})
+            except Exception as e:
+                print(f"\nError: {e}")
 
-    # ---- Measure ----
-    logger.info(
-        "Benchmark: %d -> %d tokens (spec=%s)...",
-        prompt_len, gen_len, scheduler._goose_enabled,
-    )
-    result = _submit_and_wait(prompt_len, gen_len, request_id_fmt.format("measure"))
+        self._running = False
+        self.scheduler.shutdown()
 
-    # ---- Print report ----
-    sep = "=" * 56
-    spec_label = "Goose" if scheduler._goose_enabled else "None"
-    ms_per_tok = result["e2e_s"] * 1000 / max(result["gen_tokens"], 1)
-
-    print(f"\n{sep}")
-    print("  MoeOwner Benchmark Report")
-    print(sep)
-    print(f"  Prompt length:       {prompt_len:>6d} tokens")
-    print(f"  Generation length:   {gen_len:>6d} tokens")
-    print(f"  Speculation:         {spec_label:>10s}")
-    print(sep)
-    print(f"  Time to first token: {result['ttft_s']*1000:>8.1f} ms")
-    print(f"  End-to-end time:     {result['e2e_s']:>8.3f} s")
-    print(f"  Generated tokens:    {result['gen_tokens']:>6d}")
-    print(f"  Decode steps:        {result['decode_steps']:>6d}")
-    print(f"  Throughput:          {result['throughput_tok_s']:>8.1f} tok/s")
-    print(f"  Per-token latency:   {ms_per_tok:>8.2f} ms/tok")
-    if scheduler._goose_enabled and scheduler._goose_engine is not None:
-        eng = scheduler._goose_engine
-        print(f"  Spine ratio (EMA):   {eng._spine_ratio:>8.2f}")  # noqa: SLF001
-        print(f"  PLD acceptance EMA:  {eng._pld_acceptance_ema:>8.2f}")  # noqa: SLF001
-    print(sep)
-    print()
-
-    return result
+    async def serve(self, host="0.0.0.0", port=8080):
+        """HTTP 服务。"""
+        try:
+            from api_server import serve_http
+            await serve_http(self, host=host, port=port)
+        except ImportError:
+            logger.error("api_server not available")
+        except Exception as e:
+            logger.error("HTTP serve error: %s", e)
 
 
-# ---------------------------------------------------------------------------
-# Stage 5: Main async loop with HTTP API / Benchmark
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# 基准测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SEED = [42, 17, 88, 33, 55, 99, 21, 73, 61, 8]
+
+def _make_prompt(n: int) -> list[int]:
+    t = []
+    while len(t) < n:
+        t.extend(_SEED[:n - len(t)])
+    return t or [42]
 
 
-async def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="MoeOwner — MoE Inference Engine with HTTP API"
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=os.environ.get("MODEL_NAME", ""),
-        help="HuggingFace model name",
-    )
-    parser.add_argument(
-        "--gguf",
-        type=str,
-        default=None,
-        help="Path to .gguf file (overrides --model if set)",
-    )
-    parser.add_argument(
-        "--block-size",
-        type=int,
-        default=None,
-        help="Number of tokens per KV cache block",
-    )
+async def benchmark(server: InferenceServer, plen=128, glen=128):
+    """运行基准测试。"""
+    print("\n" + "=" * 60)
+    print(f"  Benchmark: prompt={plen}, gen={glen}")
+    print("=" * 60)
 
-    # ── Long context extension args ────────────────────────
-    from long_context import LongContextConfig  # noqa: PLC0415
-    _lc_config = LongContextConfig()
-    _lc_config.add_cli_args(parser)
-    parser.add_argument(
-        "--hidden-size",
-        type=int,
-        default=4096,
-        help="Hidden dimension (for HF model metadata fallback)",
+    # 预热
+    wr = Request(prompt_tokens=_make_prompt(32), request_id="_warm", max_new_tokens=32)
+    server.scheduler.submit(wr)
+    for _ in range(100):
+        await server.scheduler.step()
+        done = any(d.is_done for d in server.scheduler.active_decode_pool if d.request_id == "_warm")
+        if done:
+            break
+
+    # 正式
+    req = Request(prompt_tokens=_make_prompt(plen), request_id="_bm", max_new_tokens=glen)
+    server.scheduler.submit(req)
+    start = time.monotonic()
+    while True:
+        await server.scheduler.step()
+        for d in server.scheduler.active_decode_pool:
+            if d.request_id == "_bm":
+                if d.is_done:
+                    break
+        else:
+            await asyncio.sleep(0.001)
+            continue
+        break
+
+    elapsed = time.monotonic() - start
+    print_request_summary(prompt_len=plen, gen_len=glen, prefill_tokens=plen, gen_tokens=glen, elapsed=elapsed)
+    return {"elapsed": elapsed}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CLI 入口
+# ═══════════════════════════════════════════════════════════════════════════
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="MoeOwner — 稠密模型推理引擎",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py                                          # 默认 7B 模型
+  python main.py --model Qwen/Qwen2.5-7B chat             # 聊天模式
+  python main.py --model Qwen/Qwen2.5-72B --quantize 4bit # 量化
+  python main.py --model Qwen/Qwen2.5-7B --draft-model Qwen/Qwen2.5-0.5B  # 投机解码
+  python main.py --mirror hf-mirror                        # 国内镜像
+  python main.py --benchmark                               # 基准测试
+        """,
     )
-    parser.add_argument(
-        "--total-blocks",
-        type=int,
-        default=None,
-        help="Override automatic GPU-memory-based block count",
-    )
-    parser.add_argument(
-        "--api-port",
-        type=int,
-        default=8000,
-        help="HTTP API server port (default: 8000, 0 to disable)",
-    )
-    parser.add_argument(
-        "--api-host",
-        type=str,
-        default="0.0.0.0",
-        help="HTTP API server bind address (default: 0.0.0.0)",
-    )
-    parser.add_argument(
-        "--verbose",
-        "-v",
-        action="store_true",
-        help="Enable debug-level logging",
-    )
-    parser.add_argument(
-        "--benchmark",
-        action="store_true",
-        help="Run built-in benchmark instead of engine loop",
-    )
-    parser.add_argument(
-        "--benchmark-prompt-len",
-        type=int,
-        default=128,
-        help="Fixed prompt token length for benchmark (default: 128)",
-    )
-    parser.add_argument(
-        "--benchmark-gen-len",
-        type=int,
-        default=128,
-        help="Fixed generation token length for benchmark (default: 128)",
-    )
-    parser.add_argument(
-        "--no-speculative",
-        action="store_true",
-        help="Disable Goose speculative decoding (auto-enabled when goose_core is available)",
-    )
-    parser.add_argument(
-        "--speculative",
-        action="store_true",
-        dest="_spec_legacy",
-        help=argparse.SUPPRESS,
-    )
+    p.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct", help="模型名")
+    p.add_argument("--mirror", default=None, help="镜像源: huggingface / hf-mirror / 自定义URL")
+    p.add_argument("--quantize", choices=["4bit", "8bit"], default=None, help="量化")
+    p.add_argument("--draft-model", default=None, help="草稿模型 (投机解码用小模型)")
+    p.add_argument("--no-compile", action="store_true", help="禁用 torch.compile")
+    p.add_argument("--no-tools", action="store_true", help="禁用工具调用")
+    p.add_argument("--benchmark", action="store_true", help="基准测试")
+    p.add_argument("--prompt-len", type=int, default=128)
+    p.add_argument("--gen-len", type=int, default=128)
+    p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("chat", nargs="?", help="'chat' 启动交互式聊天")
+    return p
+
+
+async def amain():
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+        os.environ["MOE_LOG_LEVEL"] = "debug"
 
-    # ── 启动徽标 ─────────────────────────────────────
     print_banner()
 
-    # ---- VRAM Budget Manager ----
-    from vram_budget import VRAMBudget  # noqa: PLC0415
+    # 下载
+    logger.info("Step 1/4: 确保模型已下载...")
+    mirror = ensure_model(args.model, args.mirror)
+    if args.draft_model:
+        try:
+            ensure_model(args.draft_model, args.mirror, tool_name="draft")
+        except Exception as e:
+            logger.warning("Draft model download failed: %s (继续)", e)
 
-    # Estimate model config for budget before loading
-    _is_gguf = args.gguf or (args.model and args.model.endswith(".gguf"))
-    _model_hidden_size = args.hidden_size if not _is_gguf else (args.hidden_size)
-    _model_num_layers = 32
-    _model_num_experts = 8
-    _model_is_moe = False
-    _model_params_b = None
-
-    budget = VRAMBudget(
-        model_params_b=_model_params_b,
-        hidden_size=_model_hidden_size,
-        num_layers=_model_num_layers,
-        num_experts=_model_num_experts,
-        is_moe=_model_is_moe,
-        block_size=args.block_size or 16,
+    # 加载
+    logger.info("Step 2/4: 加载模型...")
+    model, tokenizer, draft_model_obj, info = load_model(
+        args.model, args.quantize,
+        compile_model=not args.no_compile,
+        draft_model=args.draft_model,
     )
 
-    # ---- Log VRAM budget BEFORE loading model (to capture baseline free VRAM) ----
-    budget.log_status()
+    # 创建服务器
+    logger.info("Step 3/4: 初始化调度器...")
+    server = InferenceServer(model, tokenizer, draft_model_obj, info, mirror, args)
 
-    # ---- Log auto-enabled optimizations ----
-    print_optimizations(
-        hf_ok=not _is_gguf,
-        gguf_ok=_is_gguf,
-        goose_ok=_MAIN_GOOSE_OK and not args.no_speculative,
-        self_spec_ok=_MAIN_GOOSE_OK and _SKELETON_AVAILABLE,
-        afce_ok=_AFCE_AVAILABLE,
-        oef_ok=_OEF_AVAILABLE,
-        speculative_disabled=args.no_speculative,
-    )
-
-    # ---- Long context configuration ----
-    from long_context import LongContextConfig  # noqa: PLC0415
-    lc_config = LongContextConfig.from_cli(args)
-    if lc_config.enabled:
-        logger.info("  🌐 超长上下文: %s (--disable-long-context 关闭)", lc_config)
-    set_long_context_config(lc_config)
-
-    # ---- Load model ----
-    tokenizer = None
-    if _is_gguf:
-        gguf_path = args.gguf or args.model
-        model = load_and_inject_gguf_model(
-            gguf_path=gguf_path,
-            device="cuda",
-            block_size=args.block_size,
-        )
-        model_hidden_size = model.hidden_size
-        block_size = args.block_size or model.block_size
-    else:
-        model, tokenizer = load_and_inject_model(args.model, load_tokenizer=(args.api_port > 0))
-        model_hidden_size = args.hidden_size
-        block_size = args.block_size or 16
-        # Update budget with actual model info now that it's loaded
-        budget._is_moe = getattr(model.config, 'model_type', '') in ('mixtral', 'qwen2_moe', 'deepseek_v2', 'deepseek_v3', 'jetmoe')
-        budget._num_layers = getattr(model.config, 'num_hidden_layers', _model_num_layers)
-        budget._num_experts = getattr(model.config, 'num_local_experts', _model_num_experts)
-
-    # ---- Print model summary ----
-    _is_moe = getattr(model, 'is_moe', budget._is_moe)
-    _params_b = getattr(model, 'estimated_parameter_count_b', None)
+    # 打印信息
+    logger.info("Step 4/4: 就绪!")
+    print_optimizations()
     print_model_summary(
-        model_type="gguf" if _is_gguf else "hf",
-        model_name=args.gguf or args.model,
-        hidden_size=model_hidden_size,
-        num_layers=budget._num_layers,
-        num_experts=budget._num_experts,
-        is_moe=_is_moe,
-        params_b=_params_b,
+        num_layers=info["num_layers"], hidden_size=info["hidden_size"],
+        num_heads=info["num_heads"], num_kv_heads=info["num_kv_heads"],
+        vocab_size=info["vocab_size"], max_seq_len=info["max_seq_len"],
+        model_name=args.model,
     )
+    if draft_model_obj:
+        logger.info("  投机解码草稿: %s ✅", args.draft_model)
+    print_engine_ready(model_name=args.model, port=args.port, mirror=mirror)
 
-    # ---- Create cache & scheduler ----
-    cache = HybridCache(
-        block_size=block_size,
-        hidden_size=model_hidden_size,
-        total_blocks=args.total_blocks or budget.safe_total_blocks(),
-    )
-    scheduler = UnifiedScheduler(
-        model,
-        cache,
-        detokenizer=tokenizer.decode if tokenizer is not None else None,
-        vram_budget=budget,
-    )
-
-    # [Goose] Speculative decoding is auto-enabled when goose_core is available.
-    # Use --no-speculative to disable.
-    if args.no_speculative and _MAIN_GOOSE_OK:
-        scheduler._goose_enabled = False
-        scheduler._goose_engine = None
-        logger.info("Goose speculative decoding disabled via --no-speculative")
-    elif _MAIN_GOOSE_OK:
-        logger.info("Goose speculative decoding enabled (auto — use --no-speculative to disable)")
-
-    # ---- Signal handling ----
-    def _signal_handler(signum, frame):
-        logger.info("Received signal %d, shutting down gracefully...", signum)
-        scheduler.shutdown()
-
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
-
-    # ---- Start API server (if enabled) ----
-    api_task = None
-    if args.api_port > 0:
-        from api_server import run_api_server  # noqa: PLC0415
-
-        _model_name = args.gguf or args.model
-        api_task = asyncio.create_task(
-            run_api_server(
-                scheduler=scheduler,
-                host=args.api_host,
-                port=args.api_port,
-                tokenizer_decoder=tokenizer,
-                model_name=_model_name if _model_name else None,
-            )
-        )
-    # ---- Route: Benchmark or Engine loop ----
-    if args.benchmark:
-        await run_benchmark(
-            scheduler,
-            prompt_len=args.benchmark_prompt_len,
-            gen_len=args.benchmark_gen_len,
-        )
-        scheduler.shutdown()
-        logger.info("Benchmark complete.")
-        return
-
-    # ---- Engine ready ----
-    print_engine_ready(api_port=args.api_port if args.api_port > 0 else 0)
-
+    # 运行
     try:
-        while scheduler._running:
-            await scheduler.step()
-            await asyncio.sleep(0.001)
-    except asyncio.CancelledError:
+        if args.benchmark:
+            await benchmark(server, args.prompt_len, args.gen_len)
+        elif args.chat == "chat":
+            await server.interactive_chat()
+        else:
+            await server.serve(args.host, args.port)
+    except KeyboardInterrupt:
         pass
     finally:
-        scheduler.shutdown()
-        if api_task is not None and not api_task.done():
-            api_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await api_task
-        logger.info("Engine stopped.")
+        server.scheduler.shutdown()
+
+
+def main():
+    try:
+        asyncio.run(amain())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

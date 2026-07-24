@@ -1,22 +1,34 @@
 #!/usr/bin/env python3
 """
-MoeOwner 启动器 —— 零基础用户友好入口
-========================================
+MoeOwner 引导式启动器 — 零基础用户友好入口
+===============================================
 
-使用方法：
-    python launch.py                    ← 交互式菜单（推荐）
-    python launch.py --auto             ← 全自动：测试 → 启动
-    python launch.py --quick            ← 跳过测试，直接启动
+自动完成：环境检测 → 依赖安装 → 模型下载 → 启动引擎
+全程对话式引导，不需要记忆任何命令行参数。
 
-不需要记忆任何命令行参数，按提示操作即可。
+Usage:
+    python launch.py              ← 交互式（推荐）
+    python launch.py --auto       ← 全自动（默认模型 + 默认设置）
+    python launch.py --quick      ← 快速启动（跳过依赖检查）
 """
 
+import importlib.util
+import json
 import os
-import sys
-import time
+import platform
 import shutil
+import subprocess
+import sys
+import textwrap
+import time
+from pathlib import Path
+from typing import NoReturn
 
-# ── 控制台配色 ──────────────────────────────────────────────────────
+DEVNULL = subprocess.DEVNULL
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 控制台工具
+# ═══════════════════════════════════════════════════════════════════════════
 
 class Style:
     BOLD = "\033[1m"
@@ -27,421 +39,420 @@ class Style:
     MAGENTA = "\033[95m"
     RESET = "\033[0m"
     DIM = "\033[2m"
+    BLUE = "\033[94m"
+
 
 def c(text: str, *styles: str) -> str:
-    """Apply ANSI styles to text; fallback if stdout isn't a TTY."""
     if not sys.stdout.isatty():
         return text
-    prefix = "".join(styles)
-    return f"{prefix}{text}{Style.RESET}"
+    return f"{''.join(styles)}{text}{Style.RESET}"
 
 
-# ── Banner ──────────────────────────────────────────────────────────
+def header(text: str):
+    print(f"\n{c('━' * 60, Style.DIM)}")
+    print(f"  {c(text, Style.BOLD, Style.CYAN)}")
+    print(f"{c('━' * 60, Style.DIM)}")
+
+
+def success(text: str):
+    print(f"  {c('✅', Style.GREEN)} {text}")
+
+
+def warn(text: str):
+    print(f"  {c('⚠️ ', Style.YELLOW)} {text}")
+
+
+def error(text: str):
+    print(f"  {c('❌', Style.RED)} {text}")
+
+
+def info(text: str):
+    print(f"  {c('ℹ️ ', Style.DIM)} {text}")
+
+
+def ask(question: str, default: str = "y") -> bool:
+    prompt = f"  {c('?', Style.MAGENTA)} {question} "
+    if default == "y":
+        prompt += c("[Y/n]: ", Style.DIM)
+    else:
+        prompt += c("[y/N]: ", Style.DIM)
+
+    while True:
+        try:
+            ans = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        if not ans:
+            return default == "y"
+        if ans in ("y", "yes"):
+            return True
+        if ans in ("n", "no"):
+            return False
+        print(f"  {c('请输入 y 或 n', Style.YELLOW)}")
+
+
+def select(options: list[str], prompt: str = "请选择", default: int = 0) -> int:
+    """交互式选择。返回选中项的 index。"""
+    print(f"  {c(prompt, Style.CYAN)}")
+    for i, opt in enumerate(options):
+        marker = c("➤", Style.GREEN) if i == default else " "
+        print(f"    {marker} [{i}] {opt}")
+    print(f"  {c(f'选择 [0-{len(options)-1}] (默认 {default}): ', Style.DIM)}", end="")
+    try:
+        ans = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    if not ans:
+        return default
+    try:
+        idx = int(ans)
+        if 0 <= idx < len(options):
+            return idx
+    except ValueError:
+        pass
+    return default
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 依赖检测
+# ═══════════════════════════════════════════════════════════════════════════
+
+MIN_PYTHON = (3, 10)
+CORE_DEPS = {
+    "torch": {"import": "torch", "pip": "torch", "min": "2.0.0"},
+    "transformers": {"import": "transformers", "pip": "transformers", "min": "4.38.0"},
+    "numpy": {"import": "numpy", "pip": "numpy", "min": "1.24.0"},
+    "huggingface_hub": {"import": "huggingface_hub", "pip": "huggingface_hub", "min": "0.20.0"},
+}
+
+OPTIONAL_DEPS = {
+    "bitsandbytes": {"import": "bitsandbytes", "pip": "bitsandbytes", "desc": "4bit/8bit 量化"},
+    "sentencepiece": {"import": "sentencepiece", "pip": "sentencepiece", "desc": "部分模型的 tokenizer"},
+    "accelerate": {"import": "accelerate", "pip": "accelerate", "desc": "大模型加载加速"},
+}
+
+
+def check_python() -> bool:
+    """检查 Python 版本。"""
+    v = sys.version_info
+    if (v.major, v.minor) >= MIN_PYTHON:
+        success(f"Python {v.major}.{v.minor}.{v.micro}")
+        return True
+    error(f"Python {v.major}.{v.minor}.{v.micro} < 需要 3.10+")
+    return False
+
+
+def check_cuda() -> dict:
+    """检查 CUDA 和 GPU 状态。"""
+    result = {"available": False, "name": "N/A", "vram_gb": 0, "cuda_version": "N/A"}
+
+    # 先看能否 import torch
+    if not importlib.util.find_spec("torch"):
+        return result
+
+    import torch
+
+    if not torch.cuda.is_available():
+        warn("CUDA 不可用（推理将使用 CPU，速度极慢）")
+        return result
+
+    try:
+        result["available"] = True
+        result["name"] = torch.cuda.get_device_name(0)
+        free, total = torch.cuda.mem_get_info()
+        result["vram_gb"] = total / (1024**3)
+        result["free_gb"] = free / (1024**3)
+        result["cuda_version"] = torch.version.cuda or "N/A"
+        success(f"GPU: {result['name']}")
+        info(f"  显存: {result['free_gb']:.0f}/{result['vram_gb']:.0f} GiB 空闲")
+        info(f"  CUDA: {result['cuda_version']}")
+    except Exception:
+        pass
+    return result
+
+
+def check_deps(auto_install: bool = False) -> bool:
+    """检查核心依赖。auto_install=True 时自动 pip install。"""
+    header("依赖检查")
+    ok = True
+    missing = []
+
+    for name, dep in CORE_DEPS.items():
+        spec = importlib.util.find_spec(dep["import"])
+        if spec is not None:
+            try:
+                mod = importlib.import_module(dep["import"])
+                ver = getattr(mod, "__version__", "?")
+                success(f"{name} {ver}")
+            except Exception:
+                success(f"{name} (loaded)")
+        else:
+            error(f"{name} 未安装")
+            ok = False
+            missing.append(dep["pip"])
+
+    for name, dep in OPTIONAL_DEPS.items():
+        spec = importlib.util.find_spec(dep["import"])
+        if spec is not None:
+            success(f"{name} ({dep['desc']})")
+        else:
+            info(f"{name} 未安装 ({dep['desc']} — 可选)")
+
+    if missing and auto_install:
+        if ask(f"缺少 {len(missing)} 个依赖，是否自动安装?"):
+            return _pip_install(missing)
+        return False
+
+    return ok
+
+
+def _pip_install(packages: list[str]) -> bool:
+    """执行 pip install。"""
+    cmd = [sys.executable, "-m", "pip", "install"] + packages
+    print(f"\n  运行: {' '.join(cmd)}\n")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0:
+            # 重新加载
+            for pkg in packages:
+                for name in list(sys.modules.keys()):
+                    if pkg.replace("-", "_") in name:
+                        sys.modules.pop(name, None)
+            success(f"安装完成: {', '.join(packages)}")
+            return True
+        error(f"安装失败: {r.stderr[:200]}")
+        return False
+    except Exception as e:
+        error(f"安装出错: {e}")
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 模型选择
+# ═══════════════════════════════════════════════════════════════════════════
+
+RECOMMENDED_MODELS: list[dict] = [
+    {"name": "Qwen/Qwen2.5-7B-Instruct", "desc": "通用引擎，7B 最强", "vram": 16},
+    {"name": "Qwen/Qwen2.5-1.5B-Instruct", "desc": "轻量级，笔记本也能跑", "vram": 4},
+    {"name": "Qwen/Qwen2.5-14B-Instruct", "desc": "更强推理，需要 24G 显存", "vram": 28},
+    {"name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "desc": "深度思考模型", "vram": 16},
+    {"name": "Qwen/Qwen2.5-32B-Instruct", "desc": "旗舰级，需要 48G+ 显存", "vram": 64},
+    {"name": "Qwen/Qwen2.5-72B-Instruct", "desc": "超大杯，推荐 4bit 量化", "vram": 80},
+]
+
+DRAFT_MODELS: list[dict] = [
+    {"name": "none", "desc": "不使用投机解码"},
+    {"name": "Qwen/Qwen2.5-0.5B-Instruct", "desc": "轻量草稿（推荐）"},
+    {"name": "Qwen/Qwen2.5-1.5B-Instruct", "desc": "更强草稿，需要更多显存"},
+]
+
+
+def select_model(gpu_vram_gb: float = 0) -> tuple[str, str | None, str | None]:
+    """交互式模型选择。返回 (model_name, draft_model_name_or_None, mirror_or_None)。"""
+    header("模型选择")
+
+    # ── 推荐 ──────────────────────────────────────────────────────
+    print(f"  {c('推荐模型（根据你的 GPU 显存过滤）:', Style.BOLD)}")
+    filtered = []
+    for m in RECOMMENDED_MODELS:
+        if gpu_vram_gb > 0 and gpu_vram_gb < m["vram"] * 0.8:
+            continue
+        filtered.append(m)
+    if not filtered:
+        filtered = RECOMMENDED_MODELS
+
+    for i, m in enumerate(filtered):
+        vram_str = f"({m['vram']}G 推荐)" if gpu_vram_gb > 0 else ""
+        print(f"    [{i}] {m['name']} — {m['desc']} {vram_str}")
+
+    print(f"    [{len(filtered)}] 手动输入模型名")
+    print(f"    [{len(filtered)+1}] 使用默认: {filtered[0]['name']}")
+
+    try:
+        choice = input(f"\n  {c('选择模型', Style.CYAN)} [{len(filtered)+1}]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return filtered[0]["name"], None, None
+
+    if not choice or choice == str(len(filtered) + 1):
+        model = filtered[0]["name"]
+    elif choice == str(len(filtered)):
+        model = input(f"  {c('输入模型名', Style.CYAN)}: ").strip()
+    else:
+        try:
+            idx = int(choice)
+            model = filtered[idx]["name"]
+        except (ValueError, IndexError):
+            model = filtered[0]["name"]
+
+    # ── 投机解码草稿 ─────────────────────────────────────────────
+    print(f"\n  {c('投机解码（可选）:', Style.BOLD)}")
+    print(f"    用小模型生成草稿，大模型一次验证多个 token，显著加速。")
+    for i, dm in enumerate(DRAFT_MODELS):
+        print(f"    [{i}] {dm['name']} — {dm['desc']}")
+
+    try:
+        dc = input(f"\n  {c('选择草稿模型', Style.CYAN)} [0]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        dc = "0"
+    if not dc:
+        dc = "0"
+    draft = None if dc == "0" else DRAFT_MODELS[int(dc)]["name"]
+
+    # ── 镜像源 ───────────────────────────────────────────────────
+    header("镜像源")
+    print(f"    [0] 自动选择（国内自动用 hf-mirror）")
+    print(f"    [1] huggingface (官方)")
+    print(f"    [2] hf-mirror (国内镜像)")
+    print(f"    [3] 自定义 URL")
+    try:
+        mc = input(f"\n  {c('选择镜像', Style.CYAN)} [0]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        mc = "0"
+    if not mc:
+        mc = "0"
+
+    mirror_map = {"0": None, "1": "huggingface", "2": "hf-mirror", "3": "custom"}
+    mirror = mirror_map.get(mc, None)
+    if mirror == "custom":
+        mirror = input(f"  {c('输入镜像 URL', Style.CYAN)}: ").strip()
+
+    return model, draft, mirror
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 启动主流程
+# ═══════════════════════════════════════════════════════════════════════════
 
 BANNER = f"""
-{Style.CYAN}{Style.BOLD}
-    ╔═══════════════════════════════════════════╗
-    ║                                           ║
-    ║     MoeOwner 推理引擎                      ║
-    ║     Hybrid KV Cache + Goose 推测解码       ║
-    ║     + 超长上下文 (SelfExtend 默认开启)     ║
-    ║                                           ║
-    ╚═══════════════════════════════════════════╝
-{Style.RESET}
-"""
-
-MENU = f"""
-{Style.BOLD}请选择操作：{Style.RESET}
-  {Style.GREEN}[1]{Style.RESET}  完整流程：自动测试 → 启动服务
-  {Style.GREEN}[2]{Style.RESET}  仅运行基准测试（检测性能）
-  {Style.GREEN}[3]{Style.RESET}  直接启动服务（跳过测试）
-  {Style.GREEN}[4]{Style.RESET}  查看系统状态
-  {Style.GREEN}[q]{Style.RESET}  退出
-
-{Style.DIM}  💡 所有优化已默认开启，全部自动调参，零配置{Style.RESET}
+{c('╔════════════════════════════════════════════╗', Style.CYAN)}
+{c('║', Style.CYAN)}    {c('MoeOwner — 稠密模型推理引擎', Style.BOLD, Style.CYAN)}    {c('║', Style.CYAN)}
+{c('║', Style.CYAN)}    {c('FlashAttention + KV Cache + 推测解码', Style.DIM)}    {c('║', Style.CYAN)}
+{c('╚════════════════════════════════════════════╝', Style.CYAN)}
 """
 
 
-# ── 模型发现 ────────────────────────────────────────────────────────
-
-def find_gguf_models() -> list[str]:
-    """自动搜索当前目录下的 .gguf 文件。"""
-    models = []
-    search_dirs = [".", "models", "../models", "hf", "./model_loader"]
-    for d in search_dirs:
-        if not os.path.isdir(d):
-            continue
-        for f in os.listdir(d):
-            if f.endswith(".gguf"):
-                models.append(os.path.join(d, f))
-    return sorted(models)
-
-
-def find_hf_models() -> list[str]:
-    """检测环境中的 HF 模型名。"""
-    env_model = os.environ.get("MODEL_NAME", "")
-    return [env_model] if env_model else []
-
-
-def ask_model(args: list[str]) -> tuple[str, str]:
-    """让用户选择模型。返回 (model_path, model_type)  model_type = 'gguf' | 'hf'.
-
-    流程：
-      1) 自动搜索 .gguf
-      2) 检查环境变量 MODEL_NAME
-      3) 让用户选择或手动输入
-    """
-    gguf_models = find_gguf_models()
-    hf_models = find_hf_models()
-    all_options = []
-
-    if gguf_models:
-        all_options.append(("gguf", "[GGUF]", gguf_models))
-    if hf_models:
-        all_options.append(("hf", "[HF]", hf_models))
-    all_options.append(("manual", "[自定义]", []))
-
-    if not sys.stdout.isatty() or "--auto" in args or "--quick" in args:
-        # 非交互模式 —— 自动选择
-        if gguf_models:
-            return gguf_models[0], "gguf"
-        if hf_models:
-            return hf_models[0], "hf"
-        print(f"{Style.YELLOW}未找到模型文件，请使用 --gguf 或 --model 参数指定{Style.RESET}")
-        sys.exit(1)
-
-    print(f"\n{Style.BOLD}模型选择{Style.RESET}")
-    print(f"{Style.DIM}─" * 40 + Style.RESET)
-
-    idx = 1
-    options_map = {}
-    for mtype, label, models in all_options:
-        if mtype == "manual":
-            print(f"  {Style.GREEN}[{idx}]{Style.RESET}  {label} 手动指定模型路径/名称")
-            options_map[idx] = ("manual", "")
-            idx += 1
-        else:
-            for m in models:
-                display = os.path.basename(m) if mtype == "gguf" else m
-                print(f"  {Style.GREEN}[{idx}]{Style.RESET}  {label} {display}")
-                options_map[idx] = (mtype, m)
-                idx += 1
-
-    choice = input(f"\n{Style.CYAN}请选择 [1-{idx-1}]:{Style.RESET} ").strip()
-    try:
-        c = int(choice)
-        if c in options_map:
-            mtype, path = options_map[c]
-            if mtype == "manual":
-                path = input(f"{Style.CYAN}输入 GGUF 文件路径或 HF 模型名: {Style.RESET}").strip()
-                if path.endswith(".gguf"):
-                    return path, "gguf"
-                else:
-                    return path, "hf"
-            return path, mtype
-    except (ValueError, TypeError):
-        pass
-
-    # Fallback: 第一个模型
-    for mtype, label, models in all_options:
-        if models:
-            return models[0], mtype
-
-    path = input(f"{Style.YELLOW}未找到模型，请输入 GGUF 路径或 HF 模型名: {Style.RESET}").strip()
-    return path, "gguf" if path.endswith(".gguf") else "hf"
-
-
-# ── 超长上下文方法解析 ────────────────────────────────────────────
-
-LONG_CONTEXT_METHODS = ["none", "selfextend", "reattention", "yarn"]
-
-def parse_context_method(raw_args: list[str]) -> str:
-    """Extract --context-method value from raw CLI args if present."""
-    for i, a in enumerate(raw_args):
-        if a == "--context-method" and i + 1 < len(raw_args):
-            val = raw_args[i + 1]
-            if val in LONG_CONTEXT_METHODS:
-                return val
-        if a == "--disable-long-context":
-            return "none"
-    env_val = os.environ.get("CONTEXT_METHOD", "")
-    return env_val if env_val in LONG_CONTEXT_METHODS else "selfextend"
-
-
-def ask_context_method() -> str:
-    """交互式选择超长上下文方法。"""
-    print(f"\n{Style.BOLD}超长上下文扩展方法{Style.RESET}")
-    print(f"{Style.DIM}  默认: selfextend (4行代码，通吃RoPE模型，已开启)")
-    print(f"  • selfextend  — 4行代码，通吃RoPE模型 (LLaMA/Qwen/Mistral)")
-    print(f"  • reattention — 任意Transformer均可用，两步注意力")
-    print(f"  • yarn        — 行业标准，HF Transformers内置")
-    print(f"  • none        — 关闭{Style.RESET}")
-    choices_text = "/".join(f"{c}" for c in LONG_CONTEXT_METHODS)
-    method = input(f"{Style.CYAN}选择 [{choices_text}，直接回车默认 selfextend]: {Style.RESET}").strip().lower()
-    return method if method in LONG_CONTEXT_METHODS else "selfextend"
-
-
-# ── 功能函数 ────────────────────────────────────────────────────────
-
-def run_command(cmd: list[str], desc: str = "") -> int:
-    """运行命令并显示进度。"""
-    import subprocess
-    print(f"\n{Style.DIM}  $ {' '.join(cmd)}{Style.RESET}")
-    if desc:
-        print(f"  {Style.CYAN}→ {desc}...{Style.RESET}")
-    sys.stdout.flush()
-    result = subprocess.run(cmd)
-    return result.returncode
-
-
-def run_benchmark(model_path: str, mtype: str, prompt_len: int = 128,
-                  gen_len: int = 128, use_spec: bool = False,
-                  context_method: str = "none") -> int:
-    """运行基准测试。"""
-    if not os.path.exists(os.path.join(os.path.dirname(__file__) or ".", "main.py")):
-        print(f"{Style.RED}错误: 找不到 main.py{Style.RESET}")
-        return 1
-
-    cmd = [sys.executable, "-u", "main.py", "--benchmark",
-           "--benchmark-prompt-len", str(prompt_len),
-           "--benchmark-gen-len", str(gen_len)]
-    if mtype == "gguf":
-        cmd += ["--gguf", model_path]
-    else:
-        cmd += ["--model", model_path]
-    if not use_spec:
-        cmd += ["--no-speculative"]
-    if context_method and context_method != "none":
-        cmd += ["--context-method", context_method]
-
-    print(f"\n{Style.BOLD}{Style.MAGENTA}基准测试：{Style.RESET}")
-    print(f"{Style.DIM}  • 预热: 32 → 32 tokens")
-    print(f"  • 测试: {prompt_len} → {gen_len} tokens")
-    print(f"  • 推测: {'已启用 (Goose)' if use_spec else '未启用'}")
-    print(f"  • 超长上下文: {context_method if context_method != 'none' else '未启用'}")
-    print(f"  • 模型: {os.path.basename(model_path) if mtype == 'gguf' else model_path}{Style.RESET}")
-    print(f"{Style.DIM}  (测试中，请耐心等待...){Style.RESET}\n")
-    sys.stdout.flush()
-    return run_command(cmd, "运行基准测试")
-
-
-def run_interactive(model_path: str, mtype: str, api_port: int = 8000,
-                    use_spec: bool = False,
-                    context_method: str = "none"):
-    """启动 API 服务器（交互模式）。"""
-    cmd = [sys.executable, "-u", "main.py",
-           "--api-port", str(api_port)]
-    if mtype == "gguf":
-        cmd += ["--gguf", model_path]
-    else:
-        cmd += ["--model", model_path]
-    if use_spec:
-        cmd += ["--speculative"]
-    if context_method and context_method != "none":
-        cmd += ["--context-method", context_method]
-        if context_method == "selfextend":
-            cmd += ["--neighbor-window", "1024", "--group-size", "8"]
-        elif context_method == "reattention":
-            cmd += ["--reattn-top-k", "2048"]
-        elif context_method == "yarn":
-            cmd += ["--yarn-factor", "8"]
-
-    if not use_spec:
-        cmd += ["--no-speculative"]
-
-    print(f"\n{Style.GREEN}{Style.BOLD}启动服务...{Style.RESET}")
-    print(f"{Style.DIM}  • API: http://localhost:{api_port}/v1/completions")
-    print(f"  • 健康检查: http://localhost:{api_port}/health")
-    print(f"  • 模型: {os.path.basename(model_path) if mtype == 'gguf' else model_path}")
-    print(f"  • 推测: {'已启用' if use_spec else '未启用'}")
-    print(f"  • 超长上下文: {context_method if context_method != 'none' else '未启用'}")
-    print(f"{Style.DIM}  • 按 Ctrl+C 停止服务{Style.RESET}\n")
-    sys.stdout.flush()
-
-    try:
-        run_command(cmd, "服务运行中")
-    except KeyboardInterrupt:
-        print(f"\n{Style.YELLOW}已停止{Style.RESET}")
-
-
-def show_status():
-    """显示系统状态。"""
-    print(f"\n{Style.BOLD}系统状态{Style.RESET}")
-    print(f"{Style.DIM}─" * 40 + Style.RESET)
-
-    # Python 版本
-    print(f"  Python:     {sys.version.split()[0]}")
-
-    # GPU 检测
-    try:
-        import torch
-        print(f"  PyTorch:    {torch.__version__}")
-        if torch.cuda.is_available():
-            print(f"  GPU:        {torch.cuda.get_device_name(0)}")
-            free_mem, total_mem = torch.cuda.mem_get_info()
-            print(f"  显存:       {free_mem/1024**3:.1f}GB / {total_mem/1024**3:.1f}GB 可用")
-        else:
-            print(f"{Style.YELLOW}  GPU:        未检测到 CUDA 设备{Style.RESET}")
-    except ImportError:
-        print(f"{Style.RED}  PyTorch:    未安装{Style.RESET}")
-
-    # GGUF 支持
-    try:
-        from model_loader.gguf_reader import GGUFFile
-        print(f"  GGUF:       支持")
-    except ImportError:
-        print(f"{Style.YELLOW}  GGUF:       不可用{Style.RESET}")
-
-    # Goose 推测
-    try:
-        import goose_core
-        print(f"  Goose:      可用 (Phase 0/1 + Self-Spec Skeleton)")
-    except ImportError:
-        print(f"{Style.YELLOW}  Goose:      不可用{Style.RESET}")
-
-    # AFCE
-    try:
-        import afce
-        print(f"  AFCE:       可用 _(锚点缓存)_")
-    except ImportError:
-        print(f"{Style.YELLOW}  AFCE:       不可用{Style.RESET}")
-
-    # OEF
-    try:
-        import oef
-        print(f"  OEF:        可用 _(熵冻结)_")
-    except ImportError:
-        print(f"{Style.YELLOW}  OEF:        不可用{Style.RESET}")
-
-    # 发现的模型
-    ggufs = find_gguf_models()
-    if ggufs:
-        print(f"  模型文件:   {len(ggufs)} 个 .gguf 文件")
-        for m in ggufs[:3]:
-            size = os.path.getsize(m) / 1024**3
-            print(f"              • {os.path.basename(m)} ({size:.1f}GB)")
-        if len(ggufs) > 3:
-            print(f"              • ... 还有 {len(ggufs)-3} 个")
-    else:
-        print(f"{Style.YELLOW}  模型文件:   未找到 .gguf 文件{Style.RESET}")
-
+def show_welcome():
+    print(BANNER)
+    info(f"Python {sys.version.split()[0]}  |  {platform.system()}  |  {platform.machine()}")
     print()
 
 
-# ── 启动入口 ────────────────────────────────────────────────────────
+def run_interactive():
+    """交互式引导流程。"""
+    show_welcome()
 
-def main():
-    args = sys.argv[1:]
+    # ── Step 1: 环境检测 ──────────────────────────────────────────
+    header("🔍 环境检测")
+    py_ok = check_python()
+    if not py_ok:
+        error("Python 版本不符合要求，请安装 Python 3.10+")
+        sys.exit(1)
 
-    # 无参数 → 交互式菜单
-    # --auto    → 自动：测试 → 启动
-    # --quick   → 跳过测试，直接启动
+    gpu = check_cuda()
+    print()
 
-    print(BANNER)
+    # ── Step 2: 依赖安装 ──────────────────────────────────────────
+    deps_ok = check_deps(auto_install=False)
+    if not deps_ok:
+        if ask("是否自动安装缺失的核心依赖?"):
+            check_deps(auto_install=True)
 
-    auto_mode = "--auto" in args
-    quick_mode = "--quick" in args
+    # ── Step 3: 模型选择 ──────────────────────────────────────────
+    vram = gpu.get("vram_gb", 0)
+    model_name, draft_model, mirror = select_model(vram)
 
-    # 非交互模式下：自动选择模型，自动运行
-    if auto_mode or quick_mode or not sys.stdout.isatty():
-        model_path, mtype = ask_model(args)
-        use_spec = "--no-speculative" not in args  # 默认开启
-        context_method = parse_context_method(args)
+    # ── Step 4: 量化选择 ──────────────────────────────────────────
+    quantize = None
+    if gpu["available"] and vram > 0:
+        # 估算模型是否需要量化
+        has_bnb = importlib.util.find_spec("bitsandbytes") is not None
+        header("量化")
+        if vram < 24:
+            if ask("显存有限，是否启用 4-bit 量化推荐?"):
+                quantize = "4bit"
+        elif vram < 48:
+            qopts = ["无 (FP16)", "8-bit 量化", "4-bit 量化"]
+            qi = select(qopts, "选择量化方式")
+            if qi == 1:
+                quantize = "8bit"
+            elif qi == 2:
+                quantize = "4bit"
+        else:
+            info("显存充足，使用 FP16 精度")
 
-        if not quick_mode:
-            rc = run_benchmark(model_path, mtype,
-                               prompt_len=int(os.environ.get("BENCH_PROMPT_LEN", "128")),
-                               gen_len=int(os.environ.get("BENCH_GEN_LEN", "128")),
-                               use_spec=use_spec,
-                               context_method=context_method)
-            if rc != 0:
-                print(f"{Style.RED}测试失败 (exit={rc})。是否继续启动？{Style.RESET}")
-                try:
-                    resp = input("[y/N]: ").strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    resp = "n"
-                if resp != "y":
-                    sys.exit(rc)
+        if quantize and not has_bnb:
+            warn("BitsAndBytes 未安装，量化不可用")
+            if ask("是否自动安装 bitsandbytes?"):
+                _pip_install(["bitsandbytes"])
+                quantize = None  # 重试时需要重新选择
 
-        port = int(os.environ.get("API_PORT", "8000"))
-        run_interactive(model_path, mtype, api_port=port, use_spec=use_spec,
-                        context_method=context_method)
+    # ── Step 5: 确认 ──────────────────────────────────────────────
+    header("📋 配置摘要")
+    info(f"模型:       {model_name}")
+    info(f"投机解码:   {draft_model or '不使用'}")
+    info(f"量化:       {quantize or 'FP16'}")
+    info(f"镜像:       {mirror or '自动'}")
+    print()
+
+    if not ask("确认启动?"):
+        info("已取消")
         return
 
-    # ── 交互式菜单 ────────────────────────────────────────────────
+    # ── Step 6: 构建命令并执行 ───────────────────────────────────
+    cmd = [sys.executable, "main.py", "--model", model_name]
+    if draft_model:
+        cmd += ["--draft-model", draft_model]
+    if quantize:
+        cmd += ["--quantize", quantize]
+    if mirror and mirror not in ("huggingface", "auto"):
+        cmd += ["--mirror", mirror]
 
-    model_path = None
-    mtype = "gguf"
-
-    while True:
-        print(MENU)
-        choice = input(f"{Style.CYAN}请输入选项: {Style.RESET}").strip().lower()
-
-        if choice == "q":
-            print(f"{Style.YELLOW}再见！{Style.RESET}")
-            break
-
-        if choice == "4":
-            show_status()
-            input(f"{Style.DIM}按 Enter 继续...{Style.RESET}")
-            continue
-
-        if choice in ("1", "2", "3"):
-            # 选择模型（首次或记忆）
-            if model_path is None:
-                model_path, mtype = ask_model(args)
-
-            use_spec_input = input(f"{Style.CYAN}启用 Goose 推测解码？(y/N): {Style.RESET}").strip().lower()
-            use_spec = use_spec_input == "y"
-            print(f"\n  {Style.DIM}💡 超长上下文扩展默认已开启 (SelfExtend)")
-            print(f"  如需切换，启动后用 --context-method 指定{Style.RESET}")
-            context_method = "selfextend"  # 默认开启，不再询问
-
-            if choice == "2":
-                # 仅基准测试
-                run_benchmark(model_path, mtype, use_spec=use_spec,
-                              context_method=context_method)
-                input(f"\n{Style.DIM}按 Enter 继续...{Style.RESET}")
-
-            elif choice == "1":
-                # 完整流程：先测试，再启动
-                rc = run_benchmark(model_path, mtype, use_spec=use_spec,
-                                    context_method=context_method)
-                if rc != 0:
-                    print(f"{Style.RED}测试失败。仍要启动服务吗？{Style.RESET}")
-                    cont = input("[y/N]: ").strip().lower()
-                    if cont != "y":
-                        continue
-                run_interactive(model_path, mtype, use_spec=use_spec,
-                                context_method=context_method)
-                break  # 服务结束后退出
-
-            elif choice == "3":
-                # 直接启动
-                run_interactive(model_path, mtype, use_spec=use_spec,
-                                context_method=context_method)
-                break
-        else:
-            print(f"{Style.RED}无效选项，请重新输入{Style.RESET}")
+    print(f"\n  {c('启动中...', Style.GREEN)}")
+    print(f"  {c(' '.join(cmd), Style.DIM)}")
+    print()
+    os.execvp(cmd[0], cmd)
 
 
-def windows_entry():
-    """Windows 双击兼容入口。"""
-    try:
-        main()
-    except KeyboardInterrupt:
-        print(f"\n{Style.YELLOW}已退出。{Style.RESET}")
-    except Exception as e:
-        print(f"\n{Style.RED}发生错误: {e}{Style.RESET}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        if sys.stdout.isatty() and os.name == "nt":
-            input(f"\n{Style.DIM}按 Enter 退出...{Style.RESET}")
+# ═══════════════════════════════════════════════════════════════════════════
+# CLI 入口
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="MoeOwner 引导式启动器",
+    )
+    parser.add_argument("--auto", action="store_true", help="全自动模式（默认配置）")
+    parser.add_argument("--quick", action="store_true", help="跳过依赖检查")
+    parser.add_argument("--model", type=str, default=None, help="模型名")
+    parser.add_argument("--draft-model", type=str, default=None, help="草稿模型")
+    parser.add_argument("--mirror", type=str, default=None, help="镜像源")
+    parser.add_argument("--quantize", type=str, default=None, help="量化: 4bit/8bit")
+    args = parser.parse_args()
+
+    if args.auto or (args.model and not args.quick):
+        cmd = [sys.executable, "main.py", "--model", args.model or "Qwen/Qwen2.5-7B-Instruct"]
+        if args.draft_model:
+            cmd += ["--draft-model", args.draft_model]
+        if args.quantize:
+            cmd += ["--quantize", args.quantize]
+        if args.mirror:
+            cmd += ["--mirror", args.mirror]
+        # 先检查依赖
+        if not args.quick:
+            show_welcome()
+            check_deps(auto_install=True)
+        os.execvp(cmd[0], cmd)
+
+    elif args.quick:
+        cmd = [sys.executable, "main.py", "--model", args.model or "Qwen/Qwen2.5-7B-Instruct"]
+        os.execvp(cmd[0], cmd)
+
+    else:
+        run_interactive()
 
 
 if __name__ == "__main__":
-    # Windows: 双击运行时 stdout 可能没有行缓冲
-    if os.name == "nt":
-        sys.stdout.reconfigure(line_buffering=True, errors="replace")
-    windows_entry()
+    import argparse
+    main()

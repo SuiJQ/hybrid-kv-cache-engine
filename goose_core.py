@@ -16,7 +16,7 @@ Compatibility
 - KV Cache (PagedAttention + RadixAttention): ✅ prefix KV stored in
   HybridCache; draft tokens form a contiguous ≤60-token sequence; no
   non-contiguous KV issues.
-- Expert Cache + SERE: ✅ orthogonal multiplicative gains.
+- Dense Transformer models: ✅ fully supported.
 - FlashAttention + torch.compile: ✅ fixed-shape mask (padding to B=60)
   avoids recompilation.
 - Dual CUDA Stream pipeline: ✅ runs on decode_stream; prefetch_stream
@@ -747,7 +747,7 @@ class SpeculativeEngine:
         Parameters
         ----------
         model : torch.nn.Module
-            The model (GGUFModelAdapter or HF model).
+            The model (HF Transformers model).
         past_kv : list or None
             Past key-value pairs from HybridCache (per layer).
         draft_tokens : list[int]
@@ -1084,7 +1084,7 @@ class SkeletonDraftGenerator:
 
     Compatibility
     -------------
-    - Works with both HF Transformers and GGUF models
+    - Works with HF Transformers models
     - Compatible with KV cache (past_key_values pass through identity
       layers unchanged)
     - No model weight modification — purely inference-time layer skipping

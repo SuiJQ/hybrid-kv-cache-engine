@@ -42,7 +42,7 @@ ReAttention is injected at the attention kernel level, wrapping
 ``FlashAttentionKernel.forward``.  It is fully compatible with:
   - KV cache (past_key_values)
   - Goose speculative decode
-  - AFCE anchor extensions
+  - Goose speculative decode
 """
 
 from __future__ import annotations

@@ -20,10 +20,7 @@ Compatibility
 -------------
 All methods are **fully compatible** with existing MoeOwner modules:
   - Goose speculative decode
-  - AFCE anchor extensions
-  - SERE dynamic expert skipping
-  - OEF entropy freeze
-  - HybridCache KV quantization
+  - HybridCache
 
 None require changes to model weights, architecture, or training.
 """

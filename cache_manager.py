@@ -161,7 +161,7 @@ class HybridCache:
     def compute_hash(self, token_ids: list[int]) -> str:
         """Compute the cumulative radix hash for a token sequence.
 
-        Used by AFCE to look up the corresponding AnchorSidecar.
+        Used to look up the corresponding sidecar KV data.
         Also used by prefix caching logic.
         """
         if not token_ids:

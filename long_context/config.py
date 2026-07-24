@@ -33,10 +33,8 @@ class LongContextConfig:
     -------------
     All methods are compatible with:
     - Goose speculative decoding
-    - AFCE anchor extensions
-    - KV cache quantization (already in HybridCache)
-    - SERE dynamic expert skipping
-    - OEF entropy freeze
+    - KV cache (HybridCache)
+    - Goose speculative decoding
     """
 
     # ── Method selection ──────────────────────────────────────────
